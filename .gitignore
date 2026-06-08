@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# frontend build output
+dist/
+
+# Tauri/Rust build output
+src-tauri/target/
+src-tauri/gen/
+
+# local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# local environment files
+.env
+.env.*
+
+# local QA artifacts
+.playwright-cli/
+output/playwright/
