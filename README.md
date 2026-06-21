@@ -10,6 +10,7 @@ Use afuOS as a private Mac AI assistant for everyday desktop automation, multimo
 
 ## Contents
 
+- [Concept](#concept)
 - [Features](#features)
 - [Use Cases](#use-cases)
 - [Requirements](#requirements)
@@ -19,6 +20,12 @@ Use afuOS as a private Mac AI assistant for everyday desktop automation, multimo
 - [Local Permissions](#local-permissions)
 - [Skills and MCP](#skills-and-mcp)
 - [Privacy](#privacy)
+
+## Concept
+
+afuOS is inspired by Alfred, Batman's always-available butler. The goal is to bring that "call anytime" assistant experience to everyday Mac users.
+
+It feels as easy to wake as a mobile assistant, but is designed to be smarter and more capable on the desktop. afuOS can remember your preferences, understand your working context, and help with practical tasks instead of only answering one-off questions.
 
 ## Features
 
