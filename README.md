@@ -1,5 +1,7 @@
 # afuOS - Local-first macOS AI Desktop Assistant
 
+[中文 README](README.zh-CN.md)
+
 afuOS is a local-first macOS AI desktop assistant built with Tauri, Rust, React, and TypeScript.
 
 It provides a compact floating assistant for text, voice, and image interaction, OpenAI-compatible chat, local desktop actions, speech playback, conversation history, execution logs, and user-managed memory.
