@@ -6,5 +6,7 @@
   <string>阿福需要使用麦克风进行本机语音输入。</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>阿福需要使用 macOS 原生语音识别将你的语音转成文字。</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>阿福需要通过系统自动化打开应用、创建备忘录和提醒事项。</string>
 </dict>
 </plist>

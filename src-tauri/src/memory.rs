@@ -86,8 +86,11 @@ pub fn add_memory(app: &AppHandle, content: String, source: String) -> Result<Me
         updated_at: now,
     };
 
-    let connection = open_database(app)?;
-    connection
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Failed to start memory add transaction: {error}"))?;
+    transaction
         .execute(
             "INSERT INTO memories (id, content, source, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -101,9 +104,67 @@ pub fn add_memory(app: &AppHandle, content: String, source: String) -> Result<Me
         )
         .map_err(|error| format!("Failed to add memory: {error}"))?;
 
-    enforce_memory_limit(app, &connection)?;
+    enforce_memory_limit(app, &transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Failed to commit memory add: {error}"))?;
 
     Ok(memory)
+}
+
+pub fn import_memories(app: &AppHandle, memories: Vec<MemoryItem>) -> Result<usize, String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Failed to start memory import transaction: {error}"))?;
+    let mut imported = 0usize;
+
+    for memory in memories {
+        let trimmed_content = memory.content.trim();
+        if trimmed_content.is_empty() {
+            continue;
+        }
+
+        let id = if memory.id.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            memory.id.trim().to_string()
+        };
+        let source = if memory.source.trim().is_empty() {
+            "manual".to_string()
+        } else {
+            memory.source.trim().to_string()
+        };
+        let created_at = if memory.created_at > 0 {
+            memory.created_at
+        } else {
+            now_ms()
+        };
+        let updated_at = if memory.updated_at > 0 {
+            memory.updated_at
+        } else {
+            created_at
+        };
+
+        imported += transaction
+            .execute(
+                "INSERT OR IGNORE INTO memories (id, content, source, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, trimmed_content, source, created_at, updated_at],
+            )
+            .map_err(|error| format!("Failed to import memory: {error}"))?;
+    }
+
+    enforce_memory_limit(app, &transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Failed to commit memory import: {error}"))?;
+    Ok(imported)
+}
+
+pub fn enforce_memory_limit_for_app(app: &AppHandle) -> Result<(), String> {
+    let connection = open_database(app)?;
+    enforce_memory_limit(app, &connection)
 }
 
 fn enforce_memory_limit(app: &AppHandle, connection: &rusqlite::Connection) -> Result<(), String> {

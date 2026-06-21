@@ -391,6 +391,37 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    fn read_http_request(stream: &mut impl Read) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+
+        loop {
+            let size = stream.read(&mut buffer).expect("read request");
+            assert!(size > 0, "request ended before body was fully read");
+            bytes.extend_from_slice(&buffer[..size]);
+
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     #[tokio::test]
     async fn rejects_missing_tts_api_key() {
         let config = TtsRuntimeConfig {
@@ -425,12 +456,11 @@ mod tests {
 
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_http_request(&mut stream);
+            let request_lower = request.to_ascii_lowercase();
 
             assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
-            assert!(request.contains("api-key: test-key"));
+            assert!(request_lower.contains("api-key: test-key"));
             assert!(request.contains("\"modalities\":[\"text\",\"audio\"]"));
             assert!(request.contains("\"role\":\"assistant\""));
 
@@ -468,12 +498,11 @@ mod tests {
 
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_http_request(&mut stream);
+            let request_lower = request.to_ascii_lowercase();
 
             assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
-            assert!(request.contains("api-key: test-key"));
+            assert!(request_lower.contains("api-key: test-key"));
             assert!(request.contains("\"model\":\"mimo-v2.5-asr\""));
             assert!(request.contains("\"type\":\"input_audio\""));
 

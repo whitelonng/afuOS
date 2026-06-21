@@ -8,6 +8,7 @@ import {
   Command,
   FileText,
   History,
+  ImagePlus,
   KeyRound,
   Mic,
   Minus,
@@ -22,19 +23,32 @@ import {
   X
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   addMemory,
+  callMcpTool,
   cancelChatStream,
   classifyReasoningMode,
+  clearConversations,
+  clearExecutionLogs,
   clearMemories,
+  clearPermissionRules,
+  deleteConversation,
+  deleteExecutionLog,
   deleteMemory,
+  deletePermissionRule,
   executeLocalAction,
   hideAssistantWindow,
+  importMemories,
+  inspectMcpServer,
   listConversations,
   listExecutionLogs,
   listMemories,
+  listPermissionRules,
+  loadSkillDocuments,
   loadMemoryFile,
   loadConfig,
+  isTauriRuntime,
   onOpenSettings,
   onAssistantWakeup,
   planLocalAction,
@@ -45,7 +59,8 @@ import {
   startWindowDrag,
   synthesizeSpeech,
   transcribeSpeech,
-  validateShortcut
+  validateShortcut,
+  writeExecutionLog
 } from "./tauri";
 import type { MemoryFileKind } from "./tauri";
 import type {
@@ -53,14 +68,36 @@ import type {
   AssistantStatus,
   ChatMessage,
   ExecutionLog,
+  ImageAttachment,
   LocalActionRequest,
   MemoryItem,
+  PermissionRule,
+  McpRegistryEntry,
+  McpToolSummary,
+  McpToolRequest,
   ModelProfile,
-  ModelProfileKind
+  ModelProfileKind,
+  SkillRegistryEntry,
+  SkillDocument
 } from "./types";
 
 const fallbackSoulPrompt =
-  "你是阿福，也可以叫 afu。你运行在 afuos 这款 macOS 软件里，是用户的本地管家。回答简短、可靠、少废话。涉及高风险本地动作时先说明影响并要求确认。";
+  "你是阿福，也可以叫 afu。你运行在 afuos 这款 macOS 软件里，是用户的本地管家。回答简短、可靠、少废话。涉及高风险本地动作时先说明影响并要求确认。如果需要返回图片，请使用 Markdown 图片语法 ![描述](图片 URL 或本地绝对路径)。";
+
+const defaultSoulTemplate = `你是阿福，也可以叫 afu。
+你运行在 afuos 这款 macOS 软件里，是用户的本地管家。
+
+核心性格：
+- 简短、可靠、少废话。
+- 先帮助用户完成眼前任务，不主动炫耀能力。
+- 不确定时直接澄清，不编造。
+- 涉及高风险本地动作时，先说明影响并要求确认。
+- 尊重用户的权限、禁区目录和长期偏好。
+
+交互风格：
+- 中文为主，除非用户切换语言或明确要求英文。
+- 可以亲切，但不要油腻、夸张或过度拟人。
+- 执行完成后给出清楚结果；失败时说明原因和下一步。`;
 
 const statusCopy: Record<AssistantStatus, string> = {
   idle: "待命",
@@ -87,6 +124,7 @@ const settingsSections = [
 
 type SettingsSectionId = (typeof settingsSections)[number]["id"];
 type Language = AppConfig["general"]["language"];
+type ConversationSavePayload = Parameters<typeof saveConversation>[0];
 
 interface SpeechRecognitionResultLike {
   readonly isFinal: boolean;
@@ -141,7 +179,9 @@ interface ConversationState {
 }
 
 interface PendingConfirmation {
-  action: LocalActionRequest;
+  kind: "local" | "mcp";
+  action?: LocalActionRequest;
+  request?: McpToolRequest;
   assistantMessageId: string;
   title: string;
   description: string;
@@ -150,24 +190,13 @@ interface PendingConfirmation {
   riskLevel: string;
 }
 
-interface SkillEntry {
-  id: string;
-  name: string;
-  path: string;
-  enabled: boolean;
-}
-
-interface McpEntry {
-  id: string;
-  name: string;
-  command: string;
-  enabled: boolean;
-}
-
 const conversationsStorageKey = "afuos.conversations";
 const lastActivityStorageKey = "afuos.lastActivityAt";
 const skillsStorageKey = "afuos.skills";
 const mcpStorageKey = "afuos.mcpServers";
+const memoriesStorageKey = "afuos.memories";
+const memoryFileStorageKey = "afuos.memoryFile";
+const soulFileStorageKey = "afuos.soulFile";
 const autoNewConversationAfterMs = 60 * 60 * 1000;
 const wakeSpeechSilenceTimeoutMs = 3000;
 const modelSpeechSilenceTimeoutMs = 3000;
@@ -175,6 +204,101 @@ const speechActivityPollMs = 180;
 const speechActivityRmsThreshold = 5;
 const defaultRecentTurns = 12;
 const defaultSummaryMaxChars = 800;
+const maxImageAttachments = 4;
+const maxImageAttachmentBytes = 8 * 1024 * 1024;
+
+function normalizeRegistrySkills(skills: SkillRegistryEntry[]): SkillRegistryEntry[] {
+  return skills
+    .filter((skill) => skill && typeof skill.path === "string" && skill.path.trim())
+    .map((skill) => ({
+      id: skill.id || crypto.randomUUID(),
+      name: skill.name || skill.path.split("/").filter(Boolean).pop() || "Skill",
+      path: skill.path,
+      enabled: Boolean(skill.enabled)
+    }));
+}
+
+function normalizeRegistryMcpServers(servers: McpRegistryEntry[]): McpRegistryEntry[] {
+  return servers
+    .filter((server) => server && typeof server.command === "string" && server.command.trim())
+    .map((server) => ({
+      id: server.id || crypto.randomUUID(),
+      name: server.name || server.command.split(/\s+/)[0] || "MCP",
+      command: server.command,
+      enabled: Boolean(server.enabled),
+      tools: Array.isArray(server.tools) ? server.tools : [],
+      toolError: server.toolError || "",
+      checkedAt: typeof server.checkedAt === "number" ? server.checkedAt : undefined
+    }));
+}
+
+function clearLegacyLocalRegistries() {
+  localStorage.removeItem(skillsStorageKey);
+  localStorage.removeItem(mcpStorageKey);
+}
+
+function clearLegacyConversationSessions() {
+  localStorage.removeItem(conversationsStorageKey);
+}
+
+function clearLegacyMemories() {
+  localStorage.removeItem(memoriesStorageKey);
+}
+
+function clearLegacyMemoryFile(kind: MemoryFileKind) {
+  localStorage.removeItem(kind === "memory" ? memoryFileStorageKey : soulFileStorageKey);
+}
+
+function normalizeLegacyMemories(memories: MemoryItem[]) {
+  return memories
+    .filter((memory) => memory && typeof memory.content === "string" && memory.content.trim())
+    .map((memory) => ({
+      id: memory.id || crypto.randomUUID(),
+      content: memory.content.trim(),
+      source: memory.source || "manual",
+      createdAt: memory.createdAt || Date.now(),
+      updatedAt: memory.updatedAt || memory.createdAt || Date.now()
+    }));
+}
+
+function loadLegacyMemories() {
+  try {
+    return normalizeLegacyMemories(JSON.parse(localStorage.getItem(memoriesStorageKey) || "[]") as MemoryItem[]);
+  } catch {
+    clearLegacyMemories();
+    return [];
+  }
+}
+
+function loadLegacyMemoryFile(kind: MemoryFileKind) {
+  try {
+    return localStorage.getItem(kind === "memory" ? memoryFileStorageKey : soulFileStorageKey) ?? "";
+  } catch {
+    clearLegacyMemoryFile(kind);
+    return "";
+  }
+}
+
+function normalizeStoredText(value: string) {
+  return value.replace(/\r\n/g, "\n").trim();
+}
+
+function loadLegacyLocalRegistries() {
+  try {
+    return {
+      skills: normalizeRegistrySkills(JSON.parse(localStorage.getItem(skillsStorageKey) || "[]") as SkillRegistryEntry[]),
+      mcpServers: normalizeRegistryMcpServers(
+        JSON.parse(localStorage.getItem(mcpStorageKey) || "[]") as McpRegistryEntry[]
+      )
+    };
+  } catch {
+    clearLegacyLocalRegistries();
+    return {
+      skills: [],
+      mcpServers: []
+    };
+  }
+}
 
 async function convertAudioBlobToWav(blob: Blob): Promise<Blob> {
   const audioContextConstructor =
@@ -272,6 +396,13 @@ const uiCopy = {
     emptyTitle: "阿福在这里",
     emptyCopy: "按下 Cmd Shift Space 唤醒后直接说话，也可以点击输入。",
     inputPlaceholder: "问阿福...",
+    attachImage: "添加图片",
+    removeImage: "移除图片",
+    imageOnlyPrompt: "请分析这张图片。",
+    imageAttachmentLabel: "图片",
+    unsupportedImage: "只能添加 PNG、JPEG、GIF 或 WebP 图片。",
+    imageTooLarge: "单张图片不能超过 8 MB。",
+    imageLimitReached: "一次最多添加 4 张图片。",
     pushToTalk: "按住说话",
     roles: { user: "你", assistant: "阿福" },
     newConversation: "新对话",
@@ -281,6 +412,13 @@ const uiCopy = {
     historyEmptyTitle: "还没有历史对话",
     historyEmptyCopy: "开始一次对话后，它会出现在这里。",
     missingApiReply: "还没有配置模型 API Key。打开设置里的模型后保存即可。",
+    missingModelConfigReply: "当前模型配置不完整。请在设置 > 模型里补全 API 地址、模型名和 API Key。",
+    missingVisionReply: "这条消息包含图片。请在设置 > 模型里选择一个支持图片输入的多模态模型。",
+    visionUnsupportedReply: "当前多模态模型或服务端点不支持图片输入。请换成支持 vision/image input 的模型或 API 地址。",
+    modelAuthReply: "模型服务鉴权失败。请检查当前模型的 API Key 是否正确。",
+    modelRateLimitReply: "模型服务当前限流或额度不足，请稍后再试。",
+    modelEndpointReply: "模型服务地址或接口不存在。请检查 Base URL 和所选模型是否匹配。",
+    modelServiceReply: "模型服务暂时不可用，请稍后再试。",
     chatFailurePrefix: "模型调用失败：",
     configureApiKey: "配置模型 API Key",
     viewModelConfig: "查看模型配置",
@@ -292,18 +430,27 @@ const uiCopy = {
     saved: "已保存",
     addModel: "添加新模型",
     createSttProfile: "创建语音识别模型",
+    createTtsProfile: "创建语音模型",
+    deleteModel: "删除模型",
     allowOnce: "允许一次",
     cancel: "取消",
+    cancelledExecution: "已取消执行。",
+    cancelledReason: "用户取消确认",
     confirmationTitle: "需要确认",
     noLogsTitle: "还没有执行日志",
     noLogsCopy: "打开应用、复制文本或运行命令后，记录会显示在这里。",
     noFilteredLogsTitle: "没有匹配的日志",
     noFilteredLogsCopy: "换个关键词，或调整状态和风险筛选。",
+    unavailableSectionCopy: "这个设置分区暂不可用。",
     logSearchPlaceholder: "搜索标题、类型、目标或原因...",
     allStatuses: "全部状态",
     allRisks: "全部风险",
     addMemory: "添加记忆",
+    deleteConversation: "删除对话",
     clearMemory: "清空记忆",
+    clearHistory: "清空历史",
+    clearLogs: "清空日志",
+    deleteLog: "删除日志",
     memoryFileTitle: "记忆文件",
     soulFileTitle: "灵魂文件",
     saveMemoryFile: "保存文件",
@@ -316,6 +463,21 @@ const uiCopy = {
     noMemoriesCopy: "添加稳定偏好后，后续对话可以注入这些信息。",
     addSkill: "添加技能",
     addMcp: "添加 MCP",
+    inspectMcp: "检测工具",
+    inspectingMcp: "检测中",
+    mcpToolsLabel: "工具",
+    mcpNoTools: "未发现工具",
+    trustedSkill: "受信任",
+    trustedSkillHelp: "受信任的 Skill 会把 SKILL.md 内容注入模型；未受信任时只暴露名称和路径。",
+    trustedSkillOnlyMeta: "未信任，仅注入名称和路径",
+    registryNamePlaceholder: "名称",
+    rememberAllow: "始终允许",
+    savedRulesTitle: "长期授权",
+    savedRulesEmpty: "还没有保存的长期授权规则。",
+    clearPermissionRules: "清空长期授权",
+    deletePermissionRule: "删除授权",
+    permissionsHelp: "开启自动授权后，只会直接放行低风险动作。高风险 Shell、可能提交表单的浏览器操作，以及命中阻止路径的访问仍然需要确认或会被拒绝。",
+    blockedPathsHelp: "每行一个绝对路径。命中后会直接拒绝，不走自动授权。",
     skillPathPlaceholder: "本地 Skill 文件夹路径",
     mcpCommandPlaceholder: "启动命令，例如 npx -y @modelcontextprotocol/server-filesystem",
     testStt: "测试语音识别",
@@ -325,11 +487,20 @@ const uiCopy = {
     capturingGlobalShortcut: "现在按下主键",
     capturePushToTalkKey: "点击后按一个键",
     capturingPushToTalkKey: "现在按下要绑定的键",
+    stopReply: "停止回复",
     sttListening: "正在听，请说一句话...",
     sttUnsupported: "当前环境不支持所选语音识别方式。",
     sttPermissionDenied: "语音识别权限被拒绝。请到 macOS 系统设置 > 隐私与安全性 > 麦克风和语音识别，允许 afuos 后重启应用。",
     sttNoSpeech: "3 秒内没有识别到语音。请检查麦克风/语音识别权限，或靠近麦克风再试一次。",
     sttNoProfileCopy: "大模型语音识别需要一个带语音识别能力的模型配置。",
+    sttConfigIncompleteCopy: "语音识别模型配置不完整。请补全 API 地址、模型名和 API Key。",
+    ttsNoProfileCopy: "语音回复需要一个带语音能力的模型配置。",
+    ttsConfigIncompleteCopy: "语音模型配置不完整。请补全 API 地址、模型名和 API Key。",
+    speechAuthCopy: "语音服务鉴权失败。请检查所选语音模型的 API Key 是否正确。",
+    speechRateLimitCopy: "语音服务当前限流或额度不足，请稍后再试。",
+    speechEndpointCopy: "语音服务地址或接口不存在。请检查 Base URL 和模型配置。",
+    speechServiceUnavailableCopy: "语音服务暂时不可用，请稍后再试。",
+    ttsLegacyConfigHint: "检测到旧版语音配置，但旧结构没有模型字段。请新建一个语音模型，并补全 model、Base URL 和 API Key。",
     sttFailed: "语音识别失败：",
     sttResultPrefix: "识别结果：",
     ttsUnsupported: "当前环境不支持语音播放。",
@@ -360,13 +531,14 @@ const uiCopy = {
       autoSendOnVoiceEnd: "语音结束自动发送",
       pushToTalkKey: "说话按键",
       pushToTalkMode: "触发方式",
-      allowShell: "允许 Shell",
-      browserAutomation: "浏览器自动化",
+      allowShell: "自动执行低风险 Shell",
+      browserAutomation: "自动执行低风险浏览器动作",
       blockedPaths: "阻止访问路径",
       memoryEnabled: "启用记忆",
       recentTurns: "最近轮数",
       summaryChars: "摘要字符数",
-      longTermMemories: "长期记忆数"
+      longTermMemories: "长期记忆数",
+      injectedMemories: "注入记忆数"
     },
     options: {
       chinese: "中文",
@@ -392,11 +564,11 @@ const uiCopy = {
     placeholders: {
       skills: {
         title: "本地技能注册表",
-        copy: "管理本地技能入口和启用状态。"
+        copy: "管理本地技能入口和启用状态。启用项会注入后续对话上下文。"
       },
       mcp: {
         title: "MCP 配置",
-        copy: "管理外部 MCP 服务的命令和启用状态。"
+        copy: "管理外部 MCP 服务的命令和启用状态。启用项会注入后续对话上下文。"
       },
       history: {
         title: "对话历史",
@@ -440,6 +612,13 @@ const uiCopy = {
     emptyTitle: "afu is here",
     emptyCopy: "Press Cmd Shift Space to wake afu and speak, or click to type.",
     inputPlaceholder: "Ask afu...",
+    attachImage: "Add image",
+    removeImage: "Remove image",
+    imageOnlyPrompt: "Please analyze this image.",
+    imageAttachmentLabel: "Image",
+    unsupportedImage: "Only PNG, JPEG, GIF, or WebP images can be attached.",
+    imageTooLarge: "Each image must be 8 MB or smaller.",
+    imageLimitReached: "Attach up to 4 images per message.",
     pushToTalk: "Push to talk",
     roles: { user: "You", assistant: "afu" },
     newConversation: "New chat",
@@ -449,6 +628,13 @@ const uiCopy = {
     historyEmptyTitle: "No conversation history yet",
     historyEmptyCopy: "Start a chat and it will appear here.",
     missingApiReply: "No model API key is configured yet. Open Models in settings, then save.",
+    missingModelConfigReply: "The active model config is incomplete. Fill in the API base URL, model name, and API key in Settings > Models.",
+    missingVisionReply: "This message includes images. Select a vision-capable model in Settings > Models.",
+    visionUnsupportedReply: "The selected vision model or endpoint does not support image input. Use a model/API endpoint with vision support.",
+    modelAuthReply: "Model authentication failed. Check whether the current model API key is valid.",
+    modelRateLimitReply: "The model service is rate-limited or out of quota. Try again later.",
+    modelEndpointReply: "The model endpoint or route was not found. Check the Base URL and selected model.",
+    modelServiceReply: "The model service is temporarily unavailable. Try again later.",
     chatFailurePrefix: "Model call failed: ",
     configureApiKey: "Configure model API key",
     viewModelConfig: "View model config",
@@ -460,18 +646,27 @@ const uiCopy = {
     saved: "Saved",
     addModel: "Add model",
     createSttProfile: "Create STT model",
+    createTtsProfile: "Create speech model",
+    deleteModel: "Delete model",
     allowOnce: "Allow once",
     cancel: "Cancel",
+    cancelledExecution: "Execution cancelled.",
+    cancelledReason: "User cancelled confirmation",
     confirmationTitle: "Confirmation required",
     noLogsTitle: "No execution logs yet",
     noLogsCopy: "Open apps, copy text, or run commands and the records will appear here.",
     noFilteredLogsTitle: "No matching logs",
     noFilteredLogsCopy: "Try another keyword, status, or risk filter.",
+    unavailableSectionCopy: "This settings section is not available yet.",
     logSearchPlaceholder: "Search title, type, target, or reason...",
     allStatuses: "All statuses",
     allRisks: "All risks",
     addMemory: "Add memory",
+    deleteConversation: "Delete chat",
     clearMemory: "Clear memory",
+    clearHistory: "Clear history",
+    clearLogs: "Clear logs",
+    deleteLog: "Delete log",
     memoryFileTitle: "Memory file",
     soulFileTitle: "Soul file",
     saveMemoryFile: "Save file",
@@ -484,6 +679,22 @@ const uiCopy = {
     noMemoriesCopy: "Add stable preferences and future chats can use them.",
     addSkill: "Add skill",
     addMcp: "Add MCP",
+    inspectMcp: "Inspect tools",
+    inspectingMcp: "Inspecting",
+    mcpToolsLabel: "Tools",
+    mcpNoTools: "No tools found",
+    trustedSkill: "Trusted",
+    trustedSkillHelp: "Trusted Skills inject SKILL.md content into the model. Untrusted Skills only expose name and path.",
+    trustedSkillOnlyMeta: "Not trusted: only name and path are injected",
+    registryNamePlaceholder: "Name",
+    rememberAllow: "Always allow",
+    savedRulesTitle: "Saved permissions",
+    savedRulesEmpty: "No saved long-term permission rules yet.",
+    clearPermissionRules: "Clear saved permissions",
+    deletePermissionRule: "Delete permission",
+    permissionsHelp:
+      "Auto-approval only applies to low-risk actions. High-risk shell commands, browser actions with side effects, and accesses that hit blocked paths still require confirmation or are denied.",
+    blockedPathsHelp: "One absolute path per line. Any matched path is denied immediately and bypasses auto-approval.",
     skillPathPlaceholder: "Local Skill folder path",
     mcpCommandPlaceholder: "Launch command, e.g. npx -y @modelcontextprotocol/server-filesystem",
     testStt: "Test speech recognition",
@@ -493,11 +704,21 @@ const uiCopy = {
     capturingGlobalShortcut: "Press the main key",
     capturePushToTalkKey: "Click, then press a key",
     capturingPushToTalkKey: "Press the key to bind",
+    stopReply: "Stop reply",
     sttListening: "Listening. Say one sentence...",
     sttUnsupported: "This runtime does not support the selected speech recognition mode.",
     sttPermissionDenied: "Speech recognition permission was denied. Allow afuos in macOS System Settings > Privacy & Security > Microphone and Speech Recognition, then restart the app.",
     sttNoSpeech: "No speech was recognized within 3 seconds. Check microphone/speech recognition permission or move closer to the microphone.",
     sttNoProfileCopy: "Model speech recognition needs a profile with speech recognition capability.",
+    sttConfigIncompleteCopy: "The speech recognition model config is incomplete. Fill in the API base URL, model name, and API key.",
+    ttsNoProfileCopy: "Speech replies need a profile with speech capability.",
+    ttsConfigIncompleteCopy: "The speech model config is incomplete. Fill in the API base URL, model name, and API key.",
+    speechAuthCopy: "Speech service authentication failed. Check whether the selected speech model API key is valid.",
+    speechRateLimitCopy: "The speech service is rate-limited or out of quota. Try again later.",
+    speechEndpointCopy: "The speech service endpoint or route was not found. Check the Base URL and model config.",
+    speechServiceUnavailableCopy: "The speech service is temporarily unavailable. Try again later.",
+    ttsLegacyConfigHint:
+      "A legacy speech config was detected, but the old format had no model field. Create a speech profile and fill in the model, base URL, and API key.",
     sttFailed: "Speech recognition failed: ",
     sttResultPrefix: "Recognized: ",
     ttsUnsupported: "This runtime does not support speech playback.",
@@ -528,13 +749,14 @@ const uiCopy = {
       autoSendOnVoiceEnd: "Auto-send after voice",
       pushToTalkKey: "Talk key",
       pushToTalkMode: "Trigger mode",
-      allowShell: "Allow shell",
-      browserAutomation: "Browser automation",
+      allowShell: "Auto-run low-risk shell",
+      browserAutomation: "Auto-run low-risk browser actions",
       blockedPaths: "Blocked paths",
       memoryEnabled: "Memory enabled",
       recentTurns: "Recent turns",
       summaryChars: "Summary chars",
-      longTermMemories: "Long-term memories"
+      longTermMemories: "Long-term memories",
+      injectedMemories: "Injected memories"
     },
     options: {
       chinese: "中文",
@@ -560,11 +782,11 @@ const uiCopy = {
     placeholders: {
       skills: {
         title: "Local skill registry",
-        copy: "Manage local skill entries and enabled state."
+        copy: "Manage local skill entries and enabled state. Enabled entries are injected into future model context."
       },
       mcp: {
         title: "MCP configurations",
-        copy: "Manage external MCP service commands and enabled state."
+        copy: "Manage external MCP service commands and enabled state. Enabled entries are injected into future model context."
       },
       history: {
         title: "Conversation history",
@@ -578,11 +800,17 @@ const uiCopy = {
   }
 } as const;
 
-function createMessage(role: ChatMessage["role"], content: string): ChatMessage {
+function createMessage(
+  role: ChatMessage["role"],
+  content: string,
+  imageAttachments: ImageAttachment[] = []
+): ChatMessage {
   return {
     id: crypto.randomUUID(),
     role,
-    content
+    content,
+    createdAt: Date.now(),
+    ...(imageAttachments.length > 0 ? { imageAttachments } : {})
   };
 }
 
@@ -599,12 +827,75 @@ function createSession(messages: ChatMessage[] = []): ChatSession {
 }
 
 function deriveSessionTitle(messages: ChatMessage[]) {
-  const firstUserMessage = messages.find((message) => message.role === "user")?.content.trim();
-  if (!firstUserMessage) {
+  const firstUserMessage = messages.find((message) => message.role === "user");
+  const title = firstUserMessage ? messageSummaryText(firstUserMessage) : "";
+  if (!title) {
     return "新对话";
   }
 
-  return firstUserMessage.length > 22 ? `${firstUserMessage.slice(0, 22)}...` : firstUserMessage;
+  return title.length > 22 ? `${title.slice(0, 22)}...` : title;
+}
+
+function loadLegacyConversationSessions(): ChatSession[] {
+  const saved = localStorage.getItem(conversationsStorageKey);
+  if (!saved) {
+    return [];
+  }
+
+  try {
+    return (JSON.parse(saved) as ChatSession[])
+      .filter((session) => session && session.id && Array.isArray(session.messages))
+      .map((session) => {
+        const createdAt = typeof session.createdAt === "number" ? session.createdAt : Date.now();
+        const messages = session.messages
+          .filter((message) => message && typeof message.role === "string" && typeof message.content === "string")
+          .map((message, index) => ({
+            id: message.id || crypto.randomUUID(),
+            role: message.role,
+            content: message.content,
+            createdAt: typeof message.createdAt === "number" ? message.createdAt : createdAt + index,
+            ...(Array.isArray(message.imageAttachments) && message.imageAttachments.length > 0
+              ? { imageAttachments: message.imageAttachments }
+              : {})
+          }));
+
+        return {
+          id: session.id,
+          title: session.title || deriveSessionTitle(messages),
+          summary: session.summary || "",
+          messages,
+          createdAt,
+          updatedAt: typeof session.updatedAt === "number" ? session.updatedAt : createdAt
+        };
+      })
+      .sort((first, second) => second.updatedAt - first.updatedAt);
+  } catch {
+    clearLegacyConversationSessions();
+    return [];
+  }
+}
+
+async function migrateLegacyConversationSessions(sessions: ChatSession[]) {
+  for (const session of sessions) {
+    if (session.messages.length === 0) {
+      continue;
+    }
+
+    await saveConversation({
+      id: session.id,
+      title: session.title,
+      summary: session.summary,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      messages: session.messages.map((message, index) => ({
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        imageAttachments: message.imageAttachments || [],
+        createdAt: message.createdAt || session.createdAt + index
+      }))
+    });
+  }
 }
 
 function normalizeInlineText(value: string) {
@@ -621,6 +912,183 @@ function truncateText(value: string, maxChars: number) {
   }
 
   return `${value.slice(0, maxChars - 1)}…`;
+}
+
+function messageSummaryText(message: ChatMessage) {
+  const text = normalizeInlineText(message.content);
+  const imageCount = message.imageAttachments?.length || 0;
+  if (imageCount === 0) {
+    return text;
+  }
+  const imageLabel = imageCount === 1 ? "[图片]" : `[${imageCount} 张图片]`;
+  return text ? `${text} ${imageLabel}` : imageLabel;
+}
+
+type MessageContentSegment =
+  | { type: "text"; content: string }
+  | { type: "image"; alt: string; src: string };
+
+function resolveAssistantImageSource(rawSource: string) {
+  const trimmed = rawSource.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (
+    trimmed.startsWith("data:image/") ||
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("https://") ||
+    trimmed.startsWith("blob:") ||
+    trimmed.startsWith("asset:") ||
+    trimmed.startsWith("http://asset.localhost/")
+  ) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith("file://")) {
+    if (!isTauriRuntime()) {
+      return trimmed;
+    }
+
+    try {
+      const url = new URL(trimmed);
+      return convertFileSrc(decodeURIComponent(url.pathname));
+    } catch {
+      return trimmed;
+    }
+  }
+
+  if (trimmed.startsWith("/") && isTauriRuntime()) {
+    return convertFileSrc(trimmed);
+  }
+
+  return "";
+}
+
+function parseImageSource(markdownSource: string) {
+  const trimmed = markdownSource.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.startsWith("<") && trimmed.endsWith(">")) {
+    return trimmed.slice(1, -1).trim();
+  }
+
+  const titleStart = trimmed.search(/\s+"[^"]*"\s*$/);
+  if (titleStart >= 0) {
+    return trimmed.slice(0, titleStart).trim();
+  }
+
+  return trimmed;
+}
+
+function looksLikeStandaloneImageSource(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (
+    trimmed.startsWith("data:image/") ||
+    trimmed.startsWith("asset:") ||
+    trimmed.startsWith("http://asset.localhost/")
+  ) {
+    return true;
+  }
+
+  if (/^https?:\/\/\S+\.(png|jpe?g|gif|webp|svg)(\?\S*)?$/i.test(trimmed)) {
+    return true;
+  }
+
+  if (/^(file:\/\/|\/)\S+\.(png|jpe?g|gif|webp|svg)$/i.test(trimmed)) {
+    return true;
+  }
+
+  return false;
+}
+
+function pushTextAndImageLines(segments: MessageContentSegment[], content: string) {
+  const lines = content
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return;
+  }
+
+  let pendingText: string[] = [];
+  const flushPendingText = () => {
+    if (pendingText.length > 0) {
+      segments.push({ type: "text", content: pendingText.join("\n") });
+      pendingText = [];
+    }
+  };
+
+  for (const line of lines) {
+    if (looksLikeStandaloneImageSource(line)) {
+      const resolvedSource = resolveAssistantImageSource(line);
+      if (resolvedSource) {
+        flushPendingText();
+        segments.push({ type: "image", alt: "assistant-image", src: resolvedSource });
+        continue;
+      }
+    }
+    pendingText.push(line);
+  }
+
+  flushPendingText();
+}
+
+function parseMessageContent(content: string): MessageContentSegment[] {
+  const segments: MessageContentSegment[] = [];
+  const pattern = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let lastIndex = 0;
+
+  for (const match of content.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    const textBefore = content.slice(lastIndex, index);
+    pushTextAndImageLines(segments, textBefore);
+
+    const resolvedSource = resolveAssistantImageSource(parseImageSource(match[2] || ""));
+    if (resolvedSource) {
+      segments.push({
+        type: "image",
+        alt: match[1]?.trim() || "assistant-image",
+        src: resolvedSource
+      });
+    } else if (match[0]?.trim()) {
+      segments.push({ type: "text", content: match[0].trim() });
+    }
+
+    lastIndex = index + match[0].length;
+  }
+
+  const trailingText = content.slice(lastIndex);
+  pushTextAndImageLines(segments, trailingText);
+
+  return segments;
+}
+
+function isSupportedImageFile(file: File) {
+  return ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type);
+}
+
+function readImageAttachment(file: File): Promise<ImageAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      resolve({
+        id: crypto.randomUUID(),
+        name: file.name || "image",
+        mimeType: file.type,
+        dataUrl: String(reader.result),
+        size: file.size
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error("image_read_failed"));
+    reader.readAsDataURL(file);
+  });
 }
 
 function createSystemPrompt(soulContent: string): ChatMessage {
@@ -651,7 +1119,7 @@ function createConversationSummary(messages: ChatMessage[], config?: AppConfig["
   const lines = olderMessages
     .map((message) => {
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "阿福" : "系统";
-      const content = normalizeInlineText(message.content);
+      const content = messageSummaryText(message);
       return content ? `${label}: ${truncateText(content, 180)}` : "";
     })
     .filter(Boolean);
@@ -669,71 +1137,372 @@ function buildModelMessages(
   memories: MemoryItem[],
   soulContent: string,
   memoryFileContent: string,
+  registryContext: string,
   sessionSummary: string,
   messages: ChatMessage[]
 ): ChatMessage[] {
-  if (!config.memory.enabled) {
-    return [createSystemPrompt(soulContent), ...messages];
-  }
-
   const memoryConfig = config.memory;
-  const recentMessages = messages.slice(-recentMessageLimit(memoryConfig));
   const contextMessages: ChatMessage[] = [createSystemPrompt(soulContent)];
-  const summary = sessionSummary || createConversationSummary(messages, memoryConfig);
+  const recentMessages = config.memory.enabled ? messages.slice(-recentMessageLimit(memoryConfig)) : messages;
 
-  if (summary.trim()) {
-    contextMessages.push({
-      id: "conversation-summary",
-      role: "system",
-      content: `以下是较早对话摘要，只用于延续上下文，不要逐字复述：\n${summary}`
-    });
+  if (config.memory.enabled) {
+    const summary = sessionSummary || createConversationSummary(messages, memoryConfig);
+
+    if (summary.trim()) {
+      contextMessages.push({
+        id: "conversation-summary",
+        role: "system",
+        content: `以下是较早对话摘要，只用于延续上下文，不要逐字复述：\n${summary}`
+      });
+    }
+
+    const injectedMemories = memories
+      .slice(0, Math.max(0, memoryConfig.maxInjectedMemories))
+      .map((memory) => truncateText(normalizeInlineText(memory.content), 200))
+      .filter(Boolean);
+
+    if (injectedMemories.length > 0) {
+      contextMessages.push({
+        id: "long-term-memory",
+        role: "system",
+        content: `以下是用户明确保存的长期偏好。不要把权限规则或敏感信息当作记忆：\n- ${injectedMemories.join("\n- ")}`
+      });
+    }
+
+    if (memoryFileContent.trim()) {
+      contextMessages.push({
+        id: "memory-file",
+        role: "system",
+        content: `以下是用户在设置中维护的记忆文件。只把它当作长期上下文，不要逐字复述：\n${truncateText(memoryFileContent.trim(), 4000)}`
+      });
+    }
   }
 
-  const injectedMemories = memories
-    .slice(0, Math.max(0, memoryConfig.maxInjectedMemories))
-    .map((memory) => truncateText(normalizeInlineText(memory.content), 200))
-    .filter(Boolean);
-
-  if (injectedMemories.length > 0) {
+  if (registryContext.trim()) {
     contextMessages.push({
-      id: "long-term-memory",
+      id: "local-registries",
       role: "system",
-      content: `以下是用户明确保存的长期偏好。不要把权限规则或敏感信息当作记忆：\n- ${injectedMemories.join("\n- ")}`
-    });
-  }
-
-  if (memoryFileContent.trim()) {
-    contextMessages.push({
-      id: "memory-file",
-      role: "system",
-      content: `以下是用户在设置中维护的记忆文件。只把它当作长期上下文，不要逐字复述：\n${truncateText(memoryFileContent.trim(), 4000)}`
+      content: registryContext
     });
   }
 
   return [...contextMessages, ...recentMessages];
 }
 
-function createInitialConversationState(): ConversationState {
-  const saved = localStorage.getItem(conversationsStorageKey);
-  if (saved) {
-    try {
-      const sessions = (JSON.parse(saved) as ChatSession[])
-        .filter((session) => session.id && Array.isArray(session.messages))
-        .map((session) => ({
-          ...session,
-          summary: session.summary || ""
-        }))
-        .sort((first, second) => second.updatedAt - first.updatedAt);
-      if (sessions.length > 0) {
-        return {
-          activeSessionId: sessions[0].id,
-          messages: sessions[0].messages,
-          sessions
-        };
+function buildRegistryContext(
+  skills: SkillRegistryEntry[],
+  mcpServers: McpRegistryEntry[],
+  skillDocuments: SkillDocument[] = []
+) {
+  const enabledSkills = skills.filter((skill) => skill.enabled && skill.path.trim());
+  const enabledMcpServers = mcpServers.filter((server) => server.enabled && server.command.trim());
+
+  if (enabledSkills.length === 0 && enabledMcpServers.length === 0) {
+    return "";
+  }
+
+  const sections = [
+    "以下是用户在设置中启用的本地能力注册表。它们用于理解用户环境、建议下一步或解释可用能力；Skill 主要作为上下文注入，MCP 目前支持显式调用，涉及执行时仍需走现有本地动作和确认流程。",
+  ];
+
+  if (enabledSkills.length > 0) {
+    sections.push(
+      `启用的 Skills:\n${enabledSkills
+        .slice(0, 12)
+        .map((skill, index) => {
+          const document = skillDocuments[index];
+          const name = document?.name || skill.name || "Skill";
+          const header = `- ${truncateText(name, 80)}: ${truncateText(document?.path || skill.path, 220)}`;
+          if (!document) {
+            return header;
+          }
+          if (document.error) {
+            return `${header}\n  读取状态: ${truncateText(document.error, 180)}`;
+          }
+          if (!document.content.trim()) {
+            return `${header}\n  读取状态: 未信任，仅注入名称和路径`;
+          }
+          return `${header}\n  说明片段:\n${truncateText(document.content.trim(), 1600)
+            .split("\n")
+            .map((line) => `  ${line}`)
+            .join("\n")}`;
+        })
+        .join("\n")}`
+    );
+  }
+
+  if (enabledMcpServers.length > 0) {
+    sections.push(
+      `启用的 MCP 服务配置:\n${enabledMcpServers
+        .slice(0, 12)
+        .map((server) => {
+          const commandInfo = parseMcpCommand(server.command);
+          const sanitizedCommand = sanitizeModelContextText(server.command, 240);
+          const sanitizedArgs = sanitizeModelContextText(commandInfo.args.join(" "), 220);
+          const toolLines = (server.tools || [])
+            .slice(0, 20)
+            .map((tool) =>
+              `  工具: ${truncateText(tool.name, 120)}${tool.description ? ` - ${truncateText(tool.description, 220)}` : ""}`
+            );
+          return [
+            `- ${truncateText(server.name || commandInfo.executable || "MCP", 80)}: ${sanitizedCommand}`,
+            commandInfo.executable ? `  启动程序: ${truncateText(commandInfo.executable, 120)}` : "",
+            commandInfo.args.length > 0 ? `  参数: ${sanitizedArgs}` : "",
+            server.toolError ? `  检测状态: ${sanitizeModelContextText(server.toolError, 220)}` : "",
+            ...toolLines
+          ]
+            .filter(Boolean)
+            .join("\n");
+        })
+        .join("\n")}`
+    );
+  }
+
+  return sections.join("\n\n");
+}
+
+function trustedSkillPaths(config?: AppConfig | null) {
+  return new Set((config?.permissions.trustedSkills || []).map((path) => path.trim()).filter(Boolean));
+}
+
+function parseMcpCommand(command: string) {
+  const parsed = parseCommandArgv(command);
+  const normalized = "error" in parsed ? [] : parsed.argv;
+  return {
+    executable: normalized[0] || "",
+    args: normalized.slice(1, 8),
+    error: "error" in parsed ? parsed.error : ""
+  };
+}
+
+function parseCommandArgv(command: string): { argv: string[] } | { error: string } {
+  const tokens: string[] = [];
+  let current = "";
+  let quote = "";
+  let inToken = false;
+  const trimmed = command.trim();
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const character = trimmed[index];
+    if (quote) {
+      if (character === quote) {
+        quote = "";
+        continue;
       }
-    } catch {
-      localStorage.removeItem(conversationsStorageKey);
+      if (quote === "\"" && character === "\\" && index + 1 < trimmed.length) {
+        index += 1;
+        current += trimmed[index];
+        inToken = true;
+        continue;
+      }
+      current += character;
+      inToken = true;
+      continue;
     }
+
+    if (/\s/.test(character)) {
+      if (inToken) {
+        tokens.push(current);
+        current = "";
+        inToken = false;
+      }
+      continue;
+    }
+
+    if (character === "\"" || character === "'") {
+      quote = character;
+      inToken = true;
+      continue;
+    }
+
+    if (character === "\\" && index + 1 < trimmed.length) {
+      index += 1;
+      current += trimmed[index];
+      inToken = true;
+      continue;
+    }
+
+    if (isShellControlCharacter(character)) {
+      return { error: "MCP 命令不允许使用 shell 控制符，请只填写程序和参数。" };
+    }
+
+    current += character;
+    inToken = true;
+  }
+
+  if (quote) {
+    return { error: "MCP 命令包含未闭合的引号。" };
+  }
+  if (inToken) {
+    tokens.push(current);
+  }
+  if (tokens.length === 0) {
+    return { error: "MCP 命令为空。" };
+  }
+  return { argv: tokens };
+}
+
+function isShellControlCharacter(character: string) {
+  return [";", "|", "&", ">", "<", "`"].includes(character);
+}
+
+type ParsedMcpToolCall =
+  | {
+      server: McpRegistryEntry;
+      toolName: string;
+      arguments: Record<string, unknown>;
+    }
+  | { error: string };
+
+function parseMcpToolCall(text: string, mcpServers: McpRegistryEntry[]): ParsedMcpToolCall | null {
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+  const prefixes = ["调用 mcp 工具", "调用mcp工具", "调用 mcp", "调用mcp", "call mcp tool", "call mcp"];
+  const prefix = prefixes.find((candidate) => lower.startsWith(candidate.toLowerCase()));
+  if (!prefix) {
+    return null;
+  }
+
+  const body = trimmed.slice(prefix.length).trim();
+  if (!body) {
+    return { error: "请指定要调用的 MCP 工具名，例如：调用 MCP 工具 search 参数 {\"query\":\"afuos\"}" };
+  }
+
+  const { toolSpec, rawArguments } = splitMcpToolCallBody(body);
+  if (!toolSpec) {
+    return { error: "请指定要调用的 MCP 工具名。" };
+  }
+
+  const parsedArguments = parseMcpToolArguments(rawArguments);
+  if ("error" in parsedArguments) {
+    return parsedArguments;
+  }
+
+  const enabledServers = mcpServers.filter((server) => server.enabled && server.command.trim());
+  if (enabledServers.length === 0) {
+    return { error: "没有启用的 MCP 服务。请先在设置 > MCP 添加并启用服务。" };
+  }
+
+  const { serverHint, toolName } = splitMcpToolSpec(toolSpec);
+  const server = resolveMcpToolServer(enabledServers, toolName, serverHint);
+  if ("error" in server) {
+    return server;
+  }
+
+  return {
+    server,
+    toolName,
+    arguments: parsedArguments.arguments
+  };
+}
+
+function splitMcpToolCallBody(body: string) {
+  const markers = [" 参数 ", " 参数", " with ", " args ", " arguments "];
+  const match = markers
+    .map((marker) => {
+      const index = body.toLowerCase().indexOf(marker.trim().toLowerCase());
+      return index >= 0 ? { marker, index } : null;
+    })
+    .filter((item): item is { marker: string; index: number } => Boolean(item))
+    .sort((first, second) => first.index - second.index)[0];
+
+  if (!match) {
+    return {
+      toolSpec: cleanMcpToken(body),
+      rawArguments: ""
+    };
+  }
+
+  return {
+    toolSpec: cleanMcpToken(body.slice(0, match.index)),
+    rawArguments: body.slice(match.index + match.marker.trim().length).trim()
+  };
+}
+
+function parseMcpToolArguments(raw: string): { arguments: Record<string, unknown> } | { error: string } {
+  if (!raw) {
+    return { arguments: {} };
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+      return { error: "MCP 工具参数必须是 JSON 对象，例如 {\"query\":\"afuos\"}。" };
+    }
+    return { arguments: parsed as Record<string, unknown> };
+  } catch {
+    return { error: "MCP 工具参数不是有效 JSON。请使用类似 {\"query\":\"afuos\"} 的对象。" };
+  }
+}
+
+function splitMcpToolSpec(spec: string) {
+  const cleaned = cleanMcpToken(spec);
+  const dotIndex = cleaned.lastIndexOf(".");
+  if (dotIndex > 0 && dotIndex < cleaned.length - 1) {
+    return {
+      serverHint: cleaned.slice(0, dotIndex),
+      toolName: cleaned.slice(dotIndex + 1)
+    };
+  }
+  return {
+    serverHint: "",
+    toolName: cleaned
+  };
+}
+
+function resolveMcpToolServer(
+  servers: McpRegistryEntry[],
+  toolName: string,
+  serverHint: string
+): McpRegistryEntry | { error: string } {
+  const normalizedTool = toolName.toLowerCase();
+  const normalizedHint = serverHint.toLowerCase();
+  const hintedServers = normalizedHint
+    ? servers.filter((server) => {
+        const commandInfo = parseMcpCommand(server.command);
+        return [server.name, commandInfo.executable, server.command]
+          .filter(Boolean)
+          .some((value) => value.toLowerCase().includes(normalizedHint));
+      })
+    : servers;
+
+  if (hintedServers.length === 0) {
+    return { error: `没有找到匹配的 MCP 服务：${serverHint}` };
+  }
+
+  const toolMatches = hintedServers.filter((server) =>
+    (server.tools || []).some((tool) => tool.name.toLowerCase() === normalizedTool)
+  );
+  if (toolMatches.length === 1) {
+    return toolMatches[0];
+  }
+  if (toolMatches.length > 1) {
+    return { error: `多个 MCP 服务都包含工具 ${toolName}，请使用 服务名.${toolName} 指定。` };
+  }
+  if (hintedServers.length === 1) {
+    return hintedServers[0];
+  }
+
+  return { error: `没有找到已检测到的 MCP 工具：${toolName}。请先在设置 > MCP 点击“检测工具”。` };
+}
+
+function cleanMcpToken(value: string) {
+  return value
+    .trim()
+    .replace(/^工具\s*/i, "")
+    .trim()
+    .replace(/^["'“”]+|["'“”。，,]+$/g, "")
+    .trim();
+}
+
+function createInitialConversationState(): ConversationState {
+  const sessions = loadLegacyConversationSessions();
+  if (sessions.length > 0) {
+    return {
+      activeSessionId: sessions[0].id,
+      messages: sessions[0].messages,
+      sessions
+    };
   }
 
   const session = createSession();
@@ -762,7 +1531,20 @@ function selectedProfile(config: AppConfig, kind: ModelProfileKind) {
           ? config.models.selectedTtsProfileId
           : config.models.selectedSttProfileId;
 
-  return config.models.profiles.find((profile) => profile.id === selectedId && profile.capabilities.includes(kind));
+  return (
+    config.models.profiles.find((profile) => profile.id === selectedId && profile.capabilities.includes(kind)) ||
+    config.models.profiles.find((profile) => profile.capabilities.includes(kind))
+  );
+}
+
+function canStartSpeechInput(config?: AppConfig | null) {
+  if (!config) {
+    return false;
+  }
+  if (config.voice.sttMode !== "model") {
+    return true;
+  }
+  return Boolean(selectedProfile(config, "stt"));
 }
 
 function createModelProfile(kind: ModelProfileKind = "text"): ModelProfile {
@@ -922,6 +1704,15 @@ function isEditableKeyboardTarget(target: EventTarget | null) {
   return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
 }
 
+function blurNonEditableActiveElement() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || isEditableKeyboardTarget(active)) {
+    return;
+  }
+
+  active.blur();
+}
+
 function isWindowDragBlockedTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) {
     return false;
@@ -956,9 +1747,60 @@ function settingsTargetForError(error: string): SettingsSectionId {
   return "models";
 }
 
+function permissionRuleTitle(actionType: string) {
+  switch (actionType) {
+    case "shell":
+      return "Shell";
+    case "browser_search":
+      return "浏览器搜索";
+    case "open_url":
+      return "打开网址";
+    case "open_path":
+      return "打开路径";
+    case "open_app":
+      return "打开应用";
+    case "mcp_tool":
+      return "MCP 工具";
+    default:
+      return actionType;
+  }
+}
+
+function displayPermissionTarget(target: string) {
+  return redactSensitiveText(target);
+}
+
+function sanitizeModelContextText(value: string, maxChars: number) {
+  return truncateText(redactSensitiveText(value), maxChars);
+}
+
+function redactSensitiveText(value: string) {
+  return value
+    .replace(/\b(bearer\s+)[^\s"',;&]+/gi, "$1[redacted]")
+    .replace(
+      /\b(api[_-]?key|access[_-]?token|authorization|password|secret|token)(\s*[=:]\s*["']?)[^"',;&\s]+(["']?)/gi,
+      "$1$2[redacted]$3"
+    )
+    .replace(
+      /(--?(?:api[_-]?key|access[_-]?token|authorization|password|secret|token)\b(?:\s+|=)["']?)[^"',;&\s]+(["']?)/gi,
+      "$1[redacted]$2"
+    );
+}
+
+function canRememberPermission(confirmation: PendingConfirmation) {
+  return confirmation.riskLevel === "low";
+}
+
 function errorActionCopy(error: string, copy: (typeof uiCopy)[Language]) {
   if (error === "missing_api_key") {
     return copy.configureApiKey;
+  }
+  if (error === "missing_model_config") {
+    return copy.viewModelConfig;
+  }
+
+  if (error === "missing_vision_model" || error === "vision_model_unsupported") {
+    return copy.viewModelConfig;
   }
 
   const target = settingsTargetForError(error);
@@ -970,6 +1812,75 @@ function errorActionCopy(error: string, copy: (typeof uiCopy)[Language]) {
   }
 
   return copy.viewModelConfig;
+}
+
+function parseHttpErrorStatus(error: string, prefix: string) {
+  const match = new RegExp(`^${prefix}:(\\d{3})\\b`).exec(error);
+  if (!match) {
+    return null;
+  }
+  const status = Number(match[1]);
+  return Number.isFinite(status) ? status : null;
+}
+
+function formatModelHttpError(error: string, copy: (typeof uiCopy)[Language]) {
+  const status = parseHttpErrorStatus(error, "model_http_error");
+  if (!status) {
+    return null;
+  }
+  if (status === 401 || status === 403) {
+    return copy.modelAuthReply;
+  }
+  if (status === 404) {
+    return copy.modelEndpointReply;
+  }
+  if (status === 429) {
+    return copy.modelRateLimitReply;
+  }
+  if (status >= 500) {
+    return copy.modelServiceReply;
+  }
+  return null;
+}
+
+function formatSpeechHttpError(error: string, prefix: "stt_http_error" | "tts_http_error", copy: (typeof uiCopy)[Language]) {
+  const status = parseHttpErrorStatus(error, prefix);
+  if (!status) {
+    return null;
+  }
+  if (status === 401 || status === 403) {
+    return copy.speechAuthCopy;
+  }
+  if (status === 404) {
+    return copy.speechEndpointCopy;
+  }
+  if (status === 429) {
+    return copy.speechRateLimitCopy;
+  }
+  if (status >= 500) {
+    return copy.speechServiceUnavailableCopy;
+  }
+  return null;
+}
+
+function chatErrorReply(error: string, copy: (typeof uiCopy)[Language]) {
+  if (error === "missing_api_key") {
+    return copy.missingApiReply;
+  }
+  if (error === "missing_model_config" || error === "missing_base_url" || error === "missing_model") {
+    return copy.missingModelConfigReply;
+  }
+  if (error === "missing_vision_model") {
+    return copy.missingVisionReply;
+  }
+  if (error === "vision_model_unsupported") {
+    return copy.visionUnsupportedReply;
+  }
+  const formattedHttpError = formatModelHttpError(error, copy);
+  if (formattedHttpError) {
+    return formattedHttpError;
+  }
+  return `${copy.chatFailurePrefix}${error}`;
 }
 
 function reasoningModeForInput(text: string): "fast" | "thinking" {
@@ -1048,14 +1959,17 @@ function App() {
   const [draftConfig, setDraftConfig] = useState<AppConfig | null>(null);
   const [conversationState, setConversationState] = useState<ConversationState>(createInitialConversationState);
   const [input, setInput] = useState("");
+  const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpandedPinned, setIsExpandedPinned] = useState(false);
   const [activeSettings, setActiveSettings] = useState<SettingsSectionId>("general");
   const [error, setError] = useState("");
   const [saveState, setSaveState] = useState<"idle" | "saved">("idle");
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [executionLogs, setExecutionLogs] = useState<ExecutionLog[]>([]);
+  const [permissionRules, setPermissionRules] = useState<PermissionRule[]>([]);
   const [logSearch, setLogSearch] = useState("");
   const [logStatusFilter, setLogStatusFilter] = useState("");
   const [logRiskFilter, setLogRiskFilter] = useState("");
@@ -1068,10 +1982,9 @@ function App() {
   const [soulFileDraft, setSoulFileDraft] = useState(fallbackSoulPrompt);
   const [soulFilePath, setSoulFilePath] = useState("");
   const [pendingMemoryFileSave, setPendingMemoryFileSave] = useState<MemoryFileKind | null>(null);
-  const [skills, setSkills] = useState<SkillEntry[]>([]);
-  const [mcpServers, setMcpServers] = useState<McpEntry[]>([]);
   const [skillDraft, setSkillDraft] = useState("");
   const [mcpDraft, setMcpDraft] = useState("");
+  const [mcpCheckingId, setMcpCheckingId] = useState("");
   const [sttTestResult, setSttTestResult] = useState("");
   const [ttsTestResult, setTtsTestResult] = useState("");
   const [speechProcessing, setSpeechProcessing] = useState(false);
@@ -1079,6 +1992,8 @@ function App() {
   const [capturingGlobalShortcut, setCapturingGlobalShortcut] = useState(false);
   const [capturingPushToTalkKey, setCapturingPushToTalkKey] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const errorRef = useRef(error);
   const statusRef = useRef(status);
   const conversationRef = useRef(conversationState);
   const configRef = useRef<AppConfig | null>(config);
@@ -1086,6 +2001,8 @@ function App() {
   const capturingGlobalShortcutRef = useRef(capturingGlobalShortcut);
   const capturingPushToTalkKeyRef = useRef(capturingPushToTalkKey);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const hotwordRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const hotwordRestartTimerRef = useRef<number | undefined>();
   const speechSilenceTimerRef = useRef<number | undefined>();
   const speechActivityPollerRef = useRef<number | undefined>();
   const speechAudioContextRef = useRef<AudioContext | null>(null);
@@ -1094,6 +2011,8 @@ function App() {
   const speechRequestIdRef = useRef(0);
   const cancelledSpeechRequestIdRef = useRef(0);
   const latestSpeechTranscriptRef = useRef("");
+  const sendInFlightRef = useRef(false);
+  const sendCooldownUntilRef = useRef(0);
   const activeChatRequestIdRef = useRef("");
   const cancelledChatRequestIdRef = useRef("");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -1101,9 +2020,27 @@ function App() {
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const submittedSpeechTextRef = useRef("");
   const submittedSpeechAtRef = useRef(0);
+  const lastSubmittedTextRef = useRef("");
+  const lastSubmittedAtRef = useRef(0);
+  const activeSubmissionKeyRef = useRef("");
+  const recentSubmissionKeysRef = useRef<Map<string, number>>(new Map());
+  const conversationSaveQueueRef = useRef<{
+    inFlight: boolean;
+    latest: ConversationSavePayload | null;
+    lastError: string;
+  }>({
+    inFlight: false,
+    latest: null,
+    lastError: ""
+  });
   const micHoldActiveRef = useRef(false);
   const keyHoldActiveRef = useRef(false);
   const suppressNextMicClickRef = useRef(false);
+  const voiceAutoSendTimerRef = useRef<number | undefined>();
+
+  useEffect(() => {
+    errorRef.current = error;
+  }, [error]);
 
   useEffect(() => {
     statusRef.current = status;
@@ -1153,7 +2090,7 @@ function App() {
       return;
     }
 
-    void saveConversation({
+    queueConversationSave({
       id: session.id,
       title: session.title,
       summary: session.summary,
@@ -1163,9 +2100,49 @@ function App() {
         id: message.id,
         role: message.role,
         content: message.content,
-        createdAt: session.createdAt + index
+        imageAttachments: message.imageAttachments || [],
+        createdAt: message.createdAt || session.createdAt + index
       }))
     });
+  }
+
+  function queueConversationSave(payload: ConversationSavePayload) {
+    const queue = conversationSaveQueueRef.current;
+    queue.latest = payload;
+    if (!queue.inFlight) {
+      void flushConversationSaveQueue();
+    }
+  }
+
+  async function flushConversationSaveQueue() {
+    const queue = conversationSaveQueueRef.current;
+    if (queue.inFlight) {
+      return;
+    }
+
+    while (queue.latest) {
+      const payload = queue.latest;
+      queue.latest = null;
+      queue.inFlight = true;
+      try {
+        await saveConversation(payload);
+        if (queue.lastError) {
+          const previousSaveError = queue.lastError;
+          queue.lastError = "";
+          if (errorRef.current === previousSaveError) {
+            setError("");
+            setStatus((current) => (current === "error" ? "idle" : current));
+          }
+        }
+      } catch (saveError) {
+        const message = String(saveError);
+        queue.lastError = message;
+        setError(message);
+        setStatus("error");
+      } finally {
+        queue.inFlight = false;
+      }
+    }
   }
 
   function updateActiveMessages(updater: (messages: ChatMessage[]) => ChatMessage[]) {
@@ -1191,11 +2168,65 @@ function App() {
     markConversationActivity();
   }
 
+  function appendMessagePair(current: ChatMessage[], userMessage: ChatMessage, assistantMessage: ChatMessage) {
+    const now = Date.now();
+    for (let index = Math.max(0, current.length - 4); index < current.length - 1; index += 1) {
+      const existingUser = current[index];
+      const existingAssistant = current[index + 1];
+      const existingImageKey = (existingUser?.imageAttachments || []).map((image) => `${image.id}:${image.size}`).join("|");
+      const nextImageKey = (userMessage.imageAttachments || []).map((image) => `${image.id}:${image.size}`).join("|");
+      if (
+        existingUser?.role === "user" &&
+        existingAssistant?.role === "assistant" &&
+        normalizedSpeechText(existingUser.content) === normalizedSpeechText(userMessage.content) &&
+        existingImageKey === nextImageKey &&
+        now - (existingUser.createdAt || 0) < 5000
+      ) {
+        return current;
+      }
+    }
+    return [...current, userMessage, assistantMessage];
+  }
+
+  function createSubmissionKey(content: string, imageAttachments: ImageAttachment[]) {
+    const normalizedContent = normalizedSpeechText(content);
+    const imageKey = imageAttachments.map((image) => `${image.id}:${image.size}`).join("|");
+    return `${normalizedContent}__${imageKey}`;
+  }
+
+  function shouldRejectSubmission(submissionKey: string, bypassCooldown: boolean) {
+    const now = Date.now();
+    for (const [key, timestamp] of recentSubmissionKeysRef.current.entries()) {
+      if (now - timestamp >= 5000) {
+        recentSubmissionKeysRef.current.delete(key);
+      }
+    }
+
+    if (sendInFlightRef.current) {
+      return true;
+    }
+    if (!bypassCooldown && now < sendCooldownUntilRef.current) {
+      return true;
+    }
+    if (activeSubmissionKeyRef.current === submissionKey) {
+      return true;
+    }
+
+    const lastAcceptedAt = recentSubmissionKeysRef.current.get(submissionKey) || 0;
+    return now - lastAcceptedAt < 5000;
+  }
+
   function startNewConversation() {
+    if (statusRef.current === "executing") {
+      return;
+    }
+    stopTransientInteraction();
+    discardPendingConfirmation();
     if (conversationRef.current.messages.length === 0) {
       setInput("");
+      setPendingImages([]);
       setError("");
-      setIsExpanded(true);
+      pinExpandAssistant();
       markConversationActivity();
       window.setTimeout(() => inputRef.current?.focus(), 80);
       return;
@@ -1208,28 +2239,35 @@ function App() {
       sessions: [session, ...current.sessions].slice(0, 40)
     }));
     setInput("");
+    setPendingImages([]);
     setError("");
     setStatus((current) => (current === "error" ? "idle" : current));
-    setIsExpanded(true);
+    pinExpandAssistant();
     markConversationActivity();
     window.setTimeout(() => inputRef.current?.focus(), 80);
   }
 
   function resumeConversation(sessionId: string) {
+    if (statusRef.current === "executing") {
+      return;
+    }
     const session = conversationRef.current.sessions.find((item) => item.id === sessionId);
     if (!session) {
       return;
     }
 
+    stopTransientInteraction();
+    discardPendingConfirmation();
     updateConversationState((current) => ({
       ...current,
       activeSessionId: session.id,
       messages: session.messages
     }));
     setInput("");
+    setPendingImages([]);
     setError("");
     setSettingsOpen(false);
-    setIsExpanded(true);
+    pinExpandAssistant();
     markConversationActivity();
     window.setTimeout(() => inputRef.current?.focus(), 80);
   }
@@ -1240,6 +2278,102 @@ function App() {
     );
     if (previous) {
       resumeConversation(previous.id);
+    }
+  }
+
+  async function removeConversation(sessionId: string) {
+    if (statusRef.current === "executing") {
+      return;
+    }
+    const target = conversationRef.current.sessions.find((session) => session.id === sessionId);
+    if (!target) {
+      return;
+    }
+
+    stopTransientInteraction();
+    discardPendingConfirmation();
+    try {
+      await deleteConversation(sessionId);
+    } catch (deleteError) {
+      setError(String(deleteError));
+      setStatus("error");
+      return;
+    }
+
+    updateConversationState((current) => {
+      const remainingSessions = current.sessions.filter((session) => session.id !== sessionId);
+      if (remainingSessions.length === 0) {
+        const session = createSession();
+        return {
+          activeSessionId: session.id,
+          messages: [],
+          sessions: [session]
+        };
+      }
+
+      const nextActiveSession =
+        current.activeSessionId === sessionId
+          ? remainingSessions[0]
+          : remainingSessions.find((session) => session.id === current.activeSessionId) || remainingSessions[0];
+
+      return {
+        activeSessionId: nextActiveSession.id,
+        messages: nextActiveSession.id === current.activeSessionId ? current.messages : nextActiveSession.messages,
+        sessions: remainingSessions
+      };
+    });
+    setError("");
+    setPendingImages([]);
+    setStatus((current) => (current === "error" ? "idle" : current));
+  }
+
+  async function removeAllConversations() {
+    if (statusRef.current === "executing") {
+      return;
+    }
+    stopTransientInteraction();
+    discardPendingConfirmation();
+    try {
+      await clearConversations();
+    } catch (clearError) {
+      setError(String(clearError));
+      setStatus("error");
+      return;
+    }
+
+    const session = createSession();
+    updateConversationState(() => ({
+      activeSessionId: session.id,
+      messages: [],
+      sessions: [session]
+    }));
+    setInput("");
+    setPendingImages([]);
+    setError("");
+    setStatus((current) => (current === "error" ? "idle" : current));
+  }
+
+  async function removeAllExecutionLogs() {
+    try {
+      await clearExecutionLogs();
+      setExecutionLogs([]);
+      setError("");
+      setStatus((current) => (current === "error" ? "idle" : current));
+    } catch (clearError) {
+      setError(String(clearError));
+      setStatus("error");
+    }
+  }
+
+  async function removeExecutionLog(logId: string) {
+    try {
+      await deleteExecutionLog(logId);
+      setExecutionLogs((current) => current.filter((log) => log.id !== logId));
+      setError("");
+      setStatus((current) => (current === "error" ? "idle" : current));
+    } catch (deleteError) {
+      setError(String(deleteError));
+      setStatus("error");
     }
   }
 
@@ -1259,6 +2393,15 @@ function App() {
       setExecutionLogs(await listExecutionLogs());
     } catch (logsError) {
       setError(String(logsError));
+      setStatus("error");
+    }
+  }
+
+  async function refreshPermissionRules() {
+    try {
+      setPermissionRules(await listPermissionRules());
+    } catch (permissionError) {
+      setError(String(permissionError));
       setStatus("error");
     }
   }
@@ -1284,6 +2427,62 @@ function App() {
     } catch (fileError) {
       setError(String(fileError));
       setStatus("error");
+    }
+  }
+
+  async function migrateLegacyMemoryData() {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
+    await migrateLegacyMemoryItems();
+    await migrateLegacyMemoryFile("memory");
+    await migrateLegacyMemoryFile("soul");
+  }
+
+  async function migrateLegacyMemoryItems() {
+    const legacyMemories = loadLegacyMemories();
+    if (legacyMemories.length === 0) {
+      return;
+    }
+
+    const existingMemories = await listMemories();
+    const existingIds = new Set(existingMemories.map((memory) => memory.id).filter(Boolean));
+    const existingContent = new Set(existingMemories.map((memory) => normalizeStoredText(memory.content)));
+    const importableMemories = legacyMemories.filter(
+      (memory) => !existingIds.has(memory.id) && !existingContent.has(normalizeStoredText(memory.content))
+    );
+
+    if (importableMemories.length > 0) {
+      await importMemories(importableMemories);
+    }
+    clearLegacyMemories();
+  }
+
+  async function migrateLegacyMemoryFile(kind: MemoryFileKind) {
+    const legacyContent = loadLegacyMemoryFile(kind);
+    const normalizedLegacyContent = normalizeStoredText(legacyContent);
+    if (!normalizedLegacyContent) {
+      return;
+    }
+
+    const currentFile = await loadMemoryFile(kind);
+    const normalizedCurrentContent = normalizeStoredText(currentFile.content);
+    const canMigrate =
+      kind === "memory"
+        ? normalizedCurrentContent === ""
+        : normalizedCurrentContent === "" ||
+          normalizedCurrentContent === normalizeStoredText(fallbackSoulPrompt) ||
+          normalizedCurrentContent === normalizeStoredText(defaultSoulTemplate);
+
+    if (canMigrate) {
+      await saveMemoryFile(kind, legacyContent);
+      clearLegacyMemoryFile(kind);
+      return;
+    }
+
+    if (normalizedCurrentContent === normalizedLegacyContent) {
+      clearLegacyMemoryFile(kind);
     }
   }
 
@@ -1315,24 +2514,168 @@ function App() {
     }
   }
 
-  function loadLocalRegistries() {
-    try {
-      setSkills(JSON.parse(localStorage.getItem(skillsStorageKey) || "[]") as SkillEntry[]);
-      setMcpServers(JSON.parse(localStorage.getItem(mcpStorageKey) || "[]") as McpEntry[]);
-    } catch {
-      localStorage.removeItem(skillsStorageKey);
-      localStorage.removeItem(mcpStorageKey);
+  function updateDraftSkills(updater: (current: SkillRegistryEntry[]) => SkillRegistryEntry[]) {
+    updateDraft((current) => ({
+      ...current,
+      registries: {
+        ...current.registries,
+        skills: updater(current.registries.skills)
+      }
+    }));
+  }
+
+  function toggleTrustedSkill(path: string) {
+    const normalizedPath = path.trim();
+    if (!normalizedPath) {
+      return;
     }
+
+    updateDraft((current) => {
+      const trusted = new Set(current.permissions.trustedSkills.map((item) => item.trim()).filter(Boolean));
+      if (trusted.has(normalizedPath)) {
+        trusted.delete(normalizedPath);
+      } else {
+        trusted.add(normalizedPath);
+      }
+      return {
+        ...current,
+        permissions: {
+          ...current.permissions,
+          trustedSkills: Array.from(trusted)
+        }
+      };
+    });
   }
 
-  function updateSkills(next: SkillEntry[]) {
-    setSkills(next);
-    localStorage.setItem(skillsStorageKey, JSON.stringify(next));
+  function updateSkillEntry(
+    id: string,
+    patch: {
+      name?: string;
+      path?: string;
+    }
+  ) {
+    updateDraft((current) => {
+      const existing = current.registries.skills.find((skill) => skill.id === id);
+      if (!existing) {
+        return current;
+      }
+
+      const nextPath = patch.path ?? existing.path;
+      const nextSkills = current.registries.skills.map((skill) =>
+        skill.id === id
+          ? {
+              ...skill,
+              ...(patch.name !== undefined ? { name: patch.name } : {}),
+              ...(patch.path !== undefined ? { path: patch.path } : {})
+            }
+          : skill
+      );
+
+      const trustedSkills = current.permissions.trustedSkills.map((trustedPath) => {
+        if (trustedPath.trim() !== existing.path.trim()) {
+          return trustedPath;
+        }
+        return nextPath;
+      });
+
+      return {
+        ...current,
+        registries: {
+          ...current.registries,
+          skills: nextSkills
+        },
+        permissions: {
+          ...current.permissions,
+          trustedSkills
+        }
+      };
+    });
   }
 
-  function updateMcpServers(next: McpEntry[]) {
-    setMcpServers(next);
-    localStorage.setItem(mcpStorageKey, JSON.stringify(next));
+  function updateDraftMcpServers(updater: (current: McpRegistryEntry[]) => McpRegistryEntry[]) {
+    updateDraft((current) => ({
+      ...current,
+      registries: {
+        ...current.registries,
+        mcpServers: updater(current.registries.mcpServers)
+      }
+    }));
+  }
+
+  function updateMcpEntry(
+    id: string,
+    patch: {
+      name?: string;
+      command?: string;
+    }
+  ) {
+    updateDraftMcpServers((current) =>
+      current.map((server) => {
+        if (server.id !== id) {
+          return server;
+        }
+
+        const nextCommand = patch.command ?? server.command;
+        const commandChanged = patch.command !== undefined && patch.command !== server.command;
+        return {
+          ...server,
+          ...(patch.name !== undefined ? { name: patch.name } : {}),
+          ...(patch.command !== undefined ? { command: patch.command } : {}),
+          ...(commandChanged
+            ? {
+                tools: [],
+                toolError: "",
+                checkedAt: undefined,
+                name: patch.name !== undefined ? patch.name : nextCommand.split(/\s+/)[0] || server.name
+              }
+            : {})
+        };
+      })
+    );
+  }
+
+  async function loadEnabledSkillRegistryDocuments(): Promise<SkillDocument[]> {
+    const trustedPaths = trustedSkillPaths(configRef.current);
+    const enabledSkills = savedSkills.filter((skill) => skill.enabled && skill.path.trim());
+    if (enabledSkills.length === 0) {
+      return [];
+    }
+
+    const trustedEnabledSkills = enabledSkills.filter((skill) => trustedPaths.has(skill.path.trim()));
+    if (trustedEnabledSkills.length === 0) {
+      return enabledSkills.map((skill) => ({
+        path: skill.path,
+        name: skill.name || skill.path.split("/").filter(Boolean).pop() || "Skill",
+        content: "",
+        error: ""
+      }));
+    }
+
+    try {
+      const trustedDocuments = await loadSkillDocuments(trustedEnabledSkills.map((skill) => skill.path));
+      const trustedDocumentsBySkillPath = new Map(
+        trustedEnabledSkills.map((skill, index) => [skill.path.trim(), trustedDocuments[index]] as const)
+      );
+      return enabledSkills.map((skill) => {
+        const trustedDocument = trustedDocumentsBySkillPath.get(skill.path.trim());
+        if (trustedDocument) {
+          return trustedDocument;
+        }
+        return {
+          path: skill.path,
+          name: skill.name || skill.path.split("/").filter(Boolean).pop() || "Skill",
+          content: "",
+          error: ""
+        };
+      });
+    } catch (skillError) {
+      return enabledSkills.map((skill) => ({
+        path: skill.path,
+        name: skill.name || skill.path.split("/").filter(Boolean).pop() || "Skill",
+        content: "",
+        error: trustedPaths.has(skill.path.trim()) ? String(skillError) : ""
+      }));
+    }
   }
 
   function addSkillEntry() {
@@ -1340,14 +2683,14 @@ function App() {
     if (!path) {
       return;
     }
-    updateSkills([
+    updateDraftSkills((current) => [
       {
         id: crypto.randomUUID(),
         name: path.split("/").filter(Boolean).pop() || "Skill",
         path,
         enabled: true
       },
-      ...skills
+      ...current
     ]);
     setSkillDraft("");
   }
@@ -1357,16 +2700,101 @@ function App() {
     if (!command) {
       return;
     }
-    updateMcpServers([
-      {
-        id: crypto.randomUUID(),
-        name: command.split(/\s+/)[0] || "MCP",
-        command,
-        enabled: true
-      },
-      ...mcpServers
-    ]);
+    const commandInfo = parseMcpCommand(command);
+    const entry = {
+      id: crypto.randomUUID(),
+      name: commandInfo.executable || command.split(/\s+/)[0] || "MCP",
+      command,
+      enabled: true,
+      tools: [],
+      toolError: commandInfo.error
+    };
+    updateDraftMcpServers((current) => [entry, ...current]);
     setMcpDraft("");
+    if (!commandInfo.error) {
+      void inspectMcpCommand(entry.id, entry.command, entry.name);
+    }
+  }
+
+  async function inspectMcpCommand(id: string, command: string, fallbackName: string) {
+    if (!command.trim() || mcpCheckingId) {
+      return;
+    }
+
+    const commandInfo = parseMcpCommand(command);
+    if (commandInfo.error) {
+      updateDraftMcpServers((current) =>
+        current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                tools: [],
+                toolError: commandInfo.error,
+                checkedAt: Date.now()
+              }
+            : item
+        )
+      );
+      return;
+    }
+
+    setMcpCheckingId(id);
+    try {
+      const result = await inspectMcpServer(command);
+      updateDraftMcpServers((current) =>
+        current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                name: result.serverName || fallbackName || item.name,
+                tools: result.tools,
+                toolError: result.error || (result.status === "empty" ? copy.mcpNoTools : ""),
+                checkedAt: Date.now()
+              }
+            : item
+        )
+      );
+    } catch (inspectError) {
+      updateDraftMcpServers((current) =>
+        current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                tools: [],
+                toolError: String(inspectError),
+                checkedAt: Date.now()
+              }
+            : item
+        )
+      );
+    } finally {
+      setMcpCheckingId("");
+    }
+  }
+
+  async function inspectMcpEntry(id: string) {
+    const server = draftMcpServers.find((item) => item.id === id);
+    if (!server) {
+      return;
+    }
+
+    await inspectMcpCommand(server.id, server.command, server.name);
+  }
+
+  function toggleMcpEntry(id: string) {
+    const server = draftMcpServers.find((item) => item.id === id);
+    if (!server) {
+      return;
+    }
+
+    const nextEnabled = !server.enabled;
+    updateDraftMcpServers((current) =>
+      current.map((item) => (item.id === id ? { ...item, enabled: nextEnabled } : item))
+    );
+
+    if (nextEnabled && !server.checkedAt) {
+      void inspectMcpCommand(server.id, server.command, server.name);
+    }
   }
 
   function clearSpeechSilenceTimer() {
@@ -1455,6 +2883,13 @@ function App() {
     return Boolean((draftConfigRef.current ?? configRef.current)?.voice.autoSendOnVoiceEnd);
   }
 
+  function clearVoiceAutoSendTimer() {
+    if (voiceAutoSendTimerRef.current !== undefined) {
+      window.clearTimeout(voiceAutoSendTimerRef.current);
+      voiceAutoSendTimerRef.current = undefined;
+    }
+  }
+
   function scheduleVoiceAutoSend(updateTestResult: boolean, transcript: string) {
     if (!shouldAutoSendVoice(updateTestResult)) {
       return;
@@ -1465,8 +2900,10 @@ function App() {
       return;
     }
 
-    window.setTimeout(() => {
-      void handleSend(text);
+    clearVoiceAutoSendTimer();
+    voiceAutoSendTimerRef.current = window.setTimeout(() => {
+      voiceAutoSendTimerRef.current = undefined;
+      void handleSend(text, { clearComposer: true });
     }, 80);
   }
 
@@ -1535,11 +2972,18 @@ function App() {
       return;
     }
 
+    const currentConfig = draftConfigRef.current ?? configRef.current ?? draftConfig ?? config;
+    if (!currentConfig || !selectedProfile(currentConfig, "tts")) {
+      setError(`${copy.ttsFailed}${copy.ttsNoProfileCopy}`);
+      setStatus("error");
+      return;
+    }
+
     try {
       const audio = await prepareCloudTtsAudio(speechText);
       await playPreparedAudio(audio);
     } catch (ttsError) {
-      setError(`${copy.ttsFailed}${String(ttsError)}`);
+      setError(formatTtsError(ttsError));
       setStatus("idle");
     }
   }
@@ -1584,6 +3028,13 @@ function App() {
   }
 
   async function testTtsPlayback() {
+    const currentConfig = draftConfigRef.current ?? configRef.current ?? draftConfig ?? config;
+    if (!currentConfig || !selectedProfile(currentConfig, "tts")) {
+      setTtsTestResult(`${copy.ttsFailed}${copy.ttsNoProfileCopy}`);
+      setStatus("error");
+      return;
+    }
+
     setTtsTestResult(copy.ttsPlaying);
     try {
       const audio = await prepareCloudTtsAudio(
@@ -1594,13 +3045,25 @@ function App() {
       await playPreparedAudio(audio);
       setTtsTestResult(copy.ttsFinished);
     } catch (ttsError) {
-      setTtsTestResult(`${copy.ttsFailed}${String(ttsError)}`);
+      setTtsTestResult(formatTtsError(ttsError));
       setStatus("idle");
     }
   }
 
   function formatSttError(error: unknown) {
     const message = String(error);
+    if (message.includes("missing_stt_profile")) {
+      return `${copy.sttFailed}${copy.sttNoProfileCopy}`;
+    }
+
+    if (
+      message.includes("missing_stt_api_key") ||
+      message.includes("missing_stt_base_url") ||
+      message.includes("missing_stt_model")
+    ) {
+      return `${copy.sttFailed}${copy.sttConfigIncompleteCopy}`;
+    }
+
     if (
       message.includes("not-allowed") ||
       message.includes("NotAllowedError") ||
@@ -1614,7 +3077,34 @@ function App() {
       return `${copy.sttFailed}${copy.sttUnsupported}`;
     }
 
+    const formattedHttpError = formatSpeechHttpError(message, "stt_http_error", copy);
+    if (formattedHttpError) {
+      return `${copy.sttFailed}${formattedHttpError}`;
+    }
+
     return `${copy.sttFailed}${message}`;
+  }
+
+  function formatTtsError(error: unknown) {
+    const message = String(error);
+    if (message.includes("missing_tts_profile")) {
+      return `${copy.ttsFailed}${copy.ttsNoProfileCopy}`;
+    }
+
+    if (
+      message.includes("missing_tts_api_key") ||
+      message.includes("missing_tts_base_url") ||
+      message.includes("missing_tts_model")
+    ) {
+      return `${copy.ttsFailed}${copy.ttsConfigIncompleteCopy}`;
+    }
+
+    const formattedHttpError = formatSpeechHttpError(message, "tts_http_error", copy);
+    if (formattedHttpError) {
+      return `${copy.ttsFailed}${formattedHttpError}`;
+    }
+
+    return `${copy.ttsFailed}${message}`;
   }
 
   async function transcribeRecordedAudio(blob: Blob, updateTestResult: boolean) {
@@ -1658,7 +3148,7 @@ function App() {
       recognizedSpeechRef.current = true;
       latestSpeechTranscriptRef.current = transcript;
       setInput(transcript);
-      setIsExpanded(true);
+      pinExpandAssistant();
       if (updateTestResult) {
         setSttTestResult(`${copy.sttResultPrefix}${transcript}`);
       }
@@ -1686,6 +3176,17 @@ function App() {
     stopListening();
     setSpeechProcessing(false);
     recognizedSpeechRef.current = false;
+    const currentConfig = draftConfigRef.current ?? configRef.current ?? draftConfig ?? config;
+    if (!currentConfig || !selectedProfile(currentConfig, "stt")) {
+      const message = `${copy.sttFailed}${copy.sttNoProfileCopy}`;
+      setStatus("error");
+      if (updateTestResult) {
+        setSttTestResult(message);
+      } else {
+        setError(message);
+      }
+      return;
+    }
     setStatus("listening");
     if (updateTestResult) {
       setSttTestResult(copy.sttListening);
@@ -1783,7 +3284,7 @@ function App() {
         recognizedSpeechRef.current = true;
         latestSpeechTranscriptRef.current = transcript;
         setInput(transcript);
-        setIsExpanded(true);
+        pinExpandAssistant();
         clearSpeechSilenceTimer();
         if (updateTestResult) {
           setSttTestResult(`${copy.sttResultPrefix}${transcript}`);
@@ -1837,6 +3338,7 @@ function App() {
   }
 
   function startListeningFromWakeup() {
+    stopHotwordListener();
     const currentConfig = draftConfigRef.current ?? configRef.current;
     if (currentConfig?.voice.sttMode === "model") {
       void startModelSpeechRecognition(false);
@@ -1872,6 +3374,112 @@ function App() {
     startListeningFromWakeup();
   }
 
+  function shouldRunHotwordListener() {
+    const currentConfig = configRef.current;
+    return Boolean(
+      currentConfig?.general.hotwordEnabled &&
+        currentConfig.voice.sttMode === "local" &&
+        statusRef.current === "idle" &&
+        !settingsOpen &&
+        !speechRecognitionRef.current &&
+        !mediaRecorderRef.current &&
+        !speechProcessingRef.current &&
+        !activeChatRequestIdRef.current
+    );
+  }
+
+  function stopHotwordListener() {
+    if (hotwordRestartTimerRef.current) {
+      window.clearTimeout(hotwordRestartTimerRef.current);
+      hotwordRestartTimerRef.current = undefined;
+    }
+
+    const recognition = hotwordRecognitionRef.current;
+    hotwordRecognitionRef.current = null;
+    if (!recognition) {
+      return;
+    }
+
+    recognition.onresult = null;
+    recognition.onend = null;
+    recognition.onerror = null;
+    try {
+      recognition.abort();
+    } catch {
+      // Ignore browser-specific abort failures.
+    }
+  }
+
+  function restartHotwordListenerSoon() {
+    if (hotwordRestartTimerRef.current || !shouldRunHotwordListener()) {
+      return;
+    }
+
+    hotwordRestartTimerRef.current = window.setTimeout(() => {
+      hotwordRestartTimerRef.current = undefined;
+      startHotwordListener();
+    }, 500);
+  }
+
+  function hotwordMatched(transcript: string) {
+    const normalized = transcript.toLowerCase().replace(/\s+/g, "");
+    return normalized.includes("阿福") || normalized.includes("afu") || normalized.includes("heyafu");
+  }
+
+  function startHotwordListener() {
+    if (hotwordRecognitionRef.current || !shouldRunHotwordListener()) {
+      return;
+    }
+
+    const SpeechRecognition =
+      (window as SpeechWindow).SpeechRecognition || (window as SpeechWindow).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.lang = configRef.current?.general.language === "en-US" ? "en-US" : "zh-CN";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      hotwordRecognitionRef.current = recognition;
+
+      recognition.onresult = (event) => {
+        const transcript = Array.from({ length: event.results.length }, (_, index) => event.results[index]?.[0]?.transcript || "")
+          .join(" ")
+          .trim();
+        if (!transcript || !hotwordMatched(transcript)) {
+          return;
+        }
+
+        stopHotwordListener();
+        pinExpandAssistant();
+        wakeForVoice();
+      };
+
+      recognition.onend = () => {
+        if (hotwordRecognitionRef.current === recognition) {
+          hotwordRecognitionRef.current = null;
+        }
+        restartHotwordListenerSoon();
+      };
+
+      recognition.onerror = (event) => {
+        if (hotwordRecognitionRef.current === recognition) {
+          hotwordRecognitionRef.current = null;
+        }
+        if (event.error && event.error !== "no-speech" && event.error !== "aborted") {
+          setError(formatSttError(event.error || event.type || "hotword_failed"));
+        }
+        restartHotwordListenerSoon();
+      };
+
+      recognition.start();
+    } catch {
+      hotwordRecognitionRef.current = null;
+    }
+  }
+
   function isHoldPushToTalkEnabled() {
     const voiceConfig = (draftConfigRef.current ?? configRef.current ?? draftConfig ?? config)?.voice;
     return Boolean(voiceConfig?.pushToTalkEnabled && voiceConfig.pushToTalkMode === "hold");
@@ -1887,10 +3495,15 @@ function App() {
   }
 
   function startVoiceFromKeyboard() {
+    const currentConfig = draftConfigRef.current ?? configRef.current;
     maybeStartNewConversationAfterIdle();
     setSettingsOpen(false);
-    setIsExpanded(false);
+    pinExpandAssistant();
     setStatus((current) => (current === "error" ? "idle" : current));
+    if (!canStartSpeechInput(currentConfig)) {
+      window.setTimeout(() => inputRef.current?.focus(), 80);
+      return;
+    }
     startListeningFromWakeup();
   }
 
@@ -1914,12 +3527,19 @@ function App() {
       return true;
     }
 
-    const voiceConfig = (draftConfigRef.current ?? configRef.current)?.voice;
+    const currentConfig = draftConfigRef.current ?? configRef.current;
+    const voiceConfig = currentConfig?.voice;
     if (!voiceConfig?.pushToTalkEnabled || !isPushToTalkEvent(event) || isEditableKeyboardTarget(event.target)) {
       return false;
     }
 
+    if (!canStartSpeechInput(currentConfig)) {
+      return false;
+    }
+
     event.preventDefault();
+    event.stopPropagation();
+    blurNonEditableActiveElement();
     if (voiceConfig.pushToTalkMode === "hold") {
       if (!event.repeat && !keyHoldActiveRef.current) {
         keyHoldActiveRef.current = true;
@@ -1940,6 +3560,11 @@ function App() {
 
   function handlePushToTalkKeyUp(event: KeyboardEvent) {
     const voiceConfig = (draftConfigRef.current ?? configRef.current)?.voice;
+    if (voiceConfig?.pushToTalkEnabled && isPushToTalkEvent(event) && !isEditableKeyboardTarget(event.target)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+
     if (
       voiceConfig?.pushToTalkEnabled &&
       voiceConfig.pushToTalkMode === "hold" &&
@@ -1981,16 +3606,47 @@ function App() {
   }
 
   function wakeForVoice() {
+    const currentConfig = draftConfigRef.current ?? configRef.current;
     maybeStartNewConversationAfterIdle();
     setSettingsOpen(false);
-    setIsExpanded(false);
+    pinExpandAssistant();
     setStatus((current) => (current === "error" ? "idle" : current));
+    if (!canStartSpeechInput(currentConfig)) {
+      window.setTimeout(() => inputRef.current?.focus(), 80);
+      return;
+    }
     window.setTimeout(startListeningFromWakeup, 60);
   }
 
   useEffect(() => {
     loadConfig()
-      .then((loaded) => {
+      .then(async (loaded) => {
+        const legacyRegistries = loadLegacyLocalRegistries();
+        const shouldMigrateLegacyRegistries =
+          (loaded.registries.skills.length === 0 && legacyRegistries.skills.length > 0) ||
+          (loaded.registries.mcpServers.length === 0 && legacyRegistries.mcpServers.length > 0);
+
+        if (shouldMigrateLegacyRegistries) {
+          const migratedConfig = {
+            ...loaded,
+            registries: {
+              skills: loaded.registries.skills.length > 0 ? loaded.registries.skills : legacyRegistries.skills,
+              mcpServers:
+                loaded.registries.mcpServers.length > 0 ? loaded.registries.mcpServers : legacyRegistries.mcpServers
+            }
+          };
+          try {
+            const saved = await saveConfig(migratedConfig);
+            clearLegacyLocalRegistries();
+            setConfig(saved);
+            setDraftConfig(saved);
+          } catch {
+            setConfig(migratedConfig);
+            setDraftConfig(migratedConfig);
+          }
+          return;
+        }
+
         setConfig(loaded);
         setDraftConfig(loaded);
       })
@@ -2000,8 +3656,32 @@ function App() {
       });
 
     void listConversations()
-      .then((snapshots) => {
+      .then(async (snapshots) => {
         if (snapshots.length === 0) {
+          const legacySessions = loadLegacyConversationSessions();
+          if (legacySessions.length === 0) {
+            return;
+          }
+
+          try {
+            await migrateLegacyConversationSessions(legacySessions);
+            clearLegacyConversationSessions();
+          } catch {
+            return;
+          }
+
+          persistSessions(legacySessions);
+          const [activeSession] = legacySessions;
+          setConversationState({
+            activeSessionId: activeSession.id,
+            messages: activeSession.messages,
+            sessions: legacySessions
+          });
+          conversationRef.current = {
+            activeSessionId: activeSession.id,
+            messages: activeSession.messages,
+            sessions: legacySessions
+          };
           return;
         }
         const sessions = snapshots.map((snapshot) => ({
@@ -2013,10 +3693,13 @@ function App() {
           messages: snapshot.messages.map((message) => ({
             id: message.id,
             role: message.role,
-            content: message.content
+            content: message.content,
+            imageAttachments: message.imageAttachments || [],
+            createdAt: message.createdAt
           }))
         }));
         const [activeSession] = sessions;
+        persistSessions(sessions);
         setConversationState({
           activeSessionId: activeSession.id,
           messages: activeSession.messages,
@@ -2030,9 +3713,16 @@ function App() {
       })
       .catch(() => undefined);
     void refreshExecutionLogs();
-    void refreshMemories();
-    void refreshMemoryFiles();
-    loadLocalRegistries();
+    void refreshPermissionRules();
+    void migrateLegacyMemoryData()
+      .catch((migrationError) => {
+        setError(String(migrationError));
+        setStatus("error");
+      })
+      .finally(() => {
+        void refreshMemories();
+        void refreshMemoryFiles();
+      });
   }, []);
 
   useEffect(() => {
@@ -2048,7 +3738,7 @@ function App() {
     void onOpenSettings(() => {
       setSettingsOpen(true);
       setActiveSettings("general");
-      setIsExpanded(true);
+      pinExpandAssistant();
     }).then((cleanup) => {
       cleanupOpenSettings = cleanup;
     });
@@ -2072,17 +3762,34 @@ function App() {
       handlePushToTalkKeyUp(event);
     };
 
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
       stopListening();
+      stopHotwordListener();
       stopTts();
       cleanupWakeup?.();
       cleanupOpenSettings?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (shouldRunHotwordListener()) {
+      startHotwordListener();
+    } else {
+      stopHotwordListener();
+    }
+  }, [
+    config?.general.hotwordEnabled,
+    config?.general.language,
+    config?.voice.sttMode,
+    status,
+    settingsOpen,
+    speechProcessing,
+    activeChatRequestId
+  ]);
 
   const visibleMessages = useMemo(() => conversationState.messages.slice(-6), [conversationState.messages]);
   const previousConversation = conversationState.sessions.find(
@@ -2092,6 +3799,20 @@ function App() {
   const copy = uiCopy[language];
   const activeSettingsLabel = copy.nav[activeSettings];
   const voiceBusy = status === "listening" || speechProcessing;
+  const speechInputAvailable = canStartSpeechInput(config);
+  const savedSkills = config?.registries.skills || [];
+  const savedMcpServers = config?.registries.mcpServers || [];
+  const draftSkills = draftConfig?.registries.skills || [];
+  const draftMcpServers = draftConfig?.registries.mcpServers || [];
+
+  function previewExpandAssistant() {
+    setIsExpanded(true);
+  }
+
+  function pinExpandAssistant() {
+    setIsExpandedPinned(true);
+    setIsExpanded(true);
+  }
 
   function handleWindowDragStart(event: React.MouseEvent<HTMLElement>) {
     if (event.button !== 0 || isWindowDragBlockedTarget(event.target)) {
@@ -2101,207 +3822,463 @@ function App() {
     void startWindowDrag().catch(() => undefined);
   }
 
-  async function handleSend(textOverride?: string) {
-    const trimmed = (textOverride ?? input).trim();
-    if (!trimmed || (status === "thinking" && !speechProcessingRef.current)) {
+  async function addImageFiles(files: File[]) {
+    if (statusRef.current === "executing") {
+      return;
+    }
+    if (files.length === 0) {
       return;
     }
 
-    markSubmittedSpeechText(trimmed);
-    if (speechProcessingRef.current) {
-      cancelSpeechProcessing();
-    } else if (statusRef.current === "listening" || speechRecognitionRef.current || mediaRecorderRef.current) {
-      stopListening();
-    }
-    stopTts();
-    const plannedAction = await planLocalAction(trimmed);
-    if (plannedAction) {
-      const nextUserMessage = createMessage("user", trimmed);
-      const assistantMessage = createMessage("assistant", "");
+    clearVoiceAutoSendTimer();
+    const nextImages: ImageAttachment[] = [];
+    let nextError = "";
+    for (const file of files) {
+      if (pendingImages.length + nextImages.length >= maxImageAttachments) {
+        nextError = nextError || copy.imageLimitReached;
+        break;
+      }
 
-      updateActiveMessages(() => [...conversationRef.current.messages, nextUserMessage, assistantMessage]);
-      setInput("");
-      setError("");
-      setPendingConfirmation(null);
-      setStatus("executing");
+      if (!isSupportedImageFile(file)) {
+        nextError = nextError || copy.unsupportedImage;
+        continue;
+      }
+
+      if (file.size > maxImageAttachmentBytes) {
+        nextError = nextError || copy.imageTooLarge;
+        continue;
+      }
 
       try {
-        const response = await executeLocalAction(plannedAction, false);
-        if (response.status === "requiresConfirmation" && response.confirmation && response.action) {
-          setPendingConfirmation({
-            action: response.action,
-            assistantMessageId: assistantMessage.id,
-            title: response.confirmation.title,
-            description: response.confirmation.description,
-            command: response.confirmation.command,
-            target: response.confirmation.target,
-            riskLevel: response.confirmation.riskLevel
-          });
-          setStatus("confirming");
+        nextImages.push(await readImageAttachment(file));
+      } catch (imageError) {
+        nextError = nextError || String(imageError);
+      }
+    }
+
+    if (nextImages.length > 0) {
+      setPendingImages((current) => [...current, ...nextImages].slice(0, maxImageAttachments));
+      setError(nextError);
+    } else if (nextError) {
+      setError(nextError);
+    }
+  }
+
+  function handleImageInputChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+    void addImageFiles(files);
+  }
+
+  function collectTransferredImageFiles(
+    source: Pick<DataTransfer, "files" | "items">
+  ): File[] {
+    const filesFromItems = Array.from(source.items || [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    const filesFromList = Array.from(source.files || []).filter((file) => file.type.startsWith("image/"));
+
+    const uniqueFiles = new Map<string, File>();
+    for (const file of [...filesFromItems, ...filesFromList]) {
+      uniqueFiles.set(`${file.name}:${file.size}:${file.type}:${file.lastModified}`, file);
+    }
+    return Array.from(uniqueFiles.values());
+  }
+
+  function insertComposerText(text: string, textarea: HTMLTextAreaElement) {
+    if (!text) {
+      return;
+    }
+
+    const currentValue = inputRef.current?.value ?? input;
+    const start = textarea.selectionStart ?? currentValue.length;
+    const end = textarea.selectionEnd ?? currentValue.length;
+    const nextValue = `${currentValue.slice(0, start)}${text}${currentValue.slice(end)}`;
+    setInput(nextValue);
+
+    window.requestAnimationFrame(() => {
+      const target = inputRef.current ?? textarea;
+      const nextCursor = start + text.length;
+      target.focus();
+      target.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
+  function handleInputPaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const imageFiles = collectTransferredImageFiles(event.clipboardData);
+    if (imageFiles.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    if (statusRef.current === "executing") {
+      return;
+    }
+
+    const pastedText = event.clipboardData.getData("text/plain");
+    if (pastedText) {
+      insertComposerText(pastedText, event.currentTarget);
+    }
+    void addImageFiles(imageFiles);
+  }
+
+  function handleImageDrop(event: React.DragEvent<HTMLDivElement>) {
+    const imageFiles = collectTransferredImageFiles(event.dataTransfer);
+    if (imageFiles.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    if (statusRef.current === "executing") {
+      return;
+    }
+    void addImageFiles(imageFiles);
+  }
+
+  async function handleSend(
+    textOverride?: string,
+    options: { includePendingImages?: boolean; bypassCooldown?: boolean; clearComposer?: boolean } = {}
+  ) {
+    const hasTextOverride = textOverride !== undefined;
+    const includePendingImages = options.includePendingImages ?? !hasTextOverride;
+    const imagesForMessage = includePendingImages ? pendingImages : [];
+    const rawInput = textOverride ?? inputRef.current?.value ?? input;
+    const trimmed = rawInput.trim();
+    const content = trimmed || (imagesForMessage.length > 0 ? copy.imageOnlyPrompt : "");
+    const submissionKey = createSubmissionKey(content, imagesForMessage);
+    if (!content || statusRef.current === "executing" || (status === "thinking" && !speechProcessingRef.current)) {
+      return;
+    }
+    if (shouldRejectSubmission(submissionKey, Boolean(options.bypassCooldown))) {
+      return;
+    }
+    const normalizedSubmittedText = normalizedSpeechText(content);
+    if (
+      imagesForMessage.length === 0 &&
+      normalizedSubmittedText &&
+      normalizedSubmittedText === lastSubmittedTextRef.current &&
+      Date.now() - lastSubmittedAtRef.current < 5000
+    ) {
+      return;
+    }
+    clearVoiceAutoSendTimer();
+    sendInFlightRef.current = true;
+    sendCooldownUntilRef.current = Date.now() + 5000;
+    lastSubmittedTextRef.current = normalizedSubmittedText;
+    lastSubmittedAtRef.current = Date.now();
+    activeSubmissionKeyRef.current = submissionKey;
+    recentSubmissionKeysRef.current.set(submissionKey, lastSubmittedAtRef.current);
+    const shouldClearComposer = options.clearComposer ?? !hasTextOverride;
+    if (shouldClearComposer) {
+      if (inputRef.current) {
+        inputRef.current.value = "";
+      }
+      setInput("");
+    }
+    try {
+      markSubmittedSpeechText(content);
+      if (pendingConfirmation) {
+        discardPendingConfirmation();
+      }
+      if (speechProcessingRef.current) {
+        cancelSpeechProcessing();
+      } else if (statusRef.current === "listening" || speechRecognitionRef.current || mediaRecorderRef.current) {
+        stopListening();
+      }
+      stopTts();
+      const mcpToolCall = imagesForMessage.length > 0 ? null : parseMcpToolCall(content, savedMcpServers);
+      if (mcpToolCall) {
+        const nextUserMessage = createMessage("user", content);
+        const assistantMessage = createMessage("assistant", "");
+
+        updateActiveMessages((current) => appendMessagePair(current, nextUserMessage, assistantMessage));
+        setInput("");
+        setError("");
+        setPendingConfirmation(null);
+        setStatus("executing");
+
+        if ("error" in mcpToolCall) {
+          setStatus("error");
           updateActiveMessages((current) =>
-            current.map((item) =>
-              item.id === assistantMessage.id
-                ? { ...item, content: `${copy.confirmationTitle}：${response.confirmation?.title}` }
-                : item
-            )
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: mcpToolCall.error } : item))
           );
           return;
         }
 
-        setStatus(response.status === "completed" ? "idle" : "error");
-        updateActiveMessages((current) =>
-          current.map((item) => (item.id === assistantMessage.id ? { ...item, content: response.message } : item))
-        );
-        await refreshExecutionLogs();
-        if (response.status === "completed") {
-          await playTts(response.message);
-        }
-      } catch (localActionError) {
-        const message = String(localActionError);
-        setError(message);
-        setStatus("error");
-        updateActiveMessages((current) =>
-          current.map((item) => (item.id === assistantMessage.id ? { ...item, content: message } : item))
-        );
-      }
-      return;
-    }
-
-    if (!config) {
-      setError("missing_api_key");
-      setStatus("error");
-      setSettingsOpen(true);
-      setActiveSettings("models");
-      return;
-    }
-
-    const activeTextProfile = selectedProfile(config, "text");
-    if (!activeTextProfile?.apiKey.trim()) {
-      setError("missing_api_key");
-      setStatus("error");
-      setSettingsOpen(true);
-      setActiveSettings("models");
-      return;
-    }
-
-    const nextUserMessage = createMessage("user", trimmed);
-    const nextMessages = [...conversationRef.current.messages, nextUserMessage];
-    const assistantMessage = createMessage("assistant", "");
-    const requestId = crypto.randomUUID();
-
-    updateActiveMessages(() => [...nextMessages, assistantMessage]);
-    setInput("");
-    setError("");
-    cancelledChatRequestIdRef.current = "";
-    activeChatRequestIdRef.current = requestId;
-    setActiveChatRequestId(requestId);
-    setStatus("thinking");
-
-    try {
-      const ttsEnabled = Boolean(config?.voice.ttsEnabled);
-      const reasoningMode = await resolveReasoningMode(trimmed);
-      setStatus("thinking");
-      let responseText = "";
-      await sendChatStream({
-        requestId,
-        reasoningMode,
-        messages: buildModelMessages(
-          config,
-          memories,
-          soulFileContent,
-          memoryFileContent,
-          createConversationSummary(nextMessages, config.memory),
-          nextMessages
-        ),
-        onDelta: (chunk) => {
-          if (cancelledChatRequestIdRef.current === requestId) {
+        try {
+          const result = await callMcpTool(
+            {
+              command: mcpToolCall.server.command,
+              serverName: mcpToolCall.server.name,
+              toolName: mcpToolCall.toolName,
+              arguments: mcpToolCall.arguments
+            },
+            false
+          );
+          if (result.status === "requiresConfirmation" && result.confirmation && result.request) {
+            setPendingConfirmation({
+              kind: "mcp",
+              request: result.request,
+              assistantMessageId: assistantMessage.id,
+              title: result.confirmation.title,
+              description: result.confirmation.description,
+              command: result.confirmation.command,
+              target: result.confirmation.target,
+              riskLevel: result.confirmation.riskLevel
+            });
+            setStatus("confirming");
+            updateActiveMessages((current) =>
+              current.map((item) =>
+                item.id === assistantMessage.id
+                  ? { ...item, content: `${copy.confirmationTitle}：${result.confirmation?.title}` }
+                  : item
+              )
+            );
             return;
           }
 
-          responseText = `${responseText}${chunk}`;
-          if (!ttsEnabled) {
-            const displayText = assistantTextForDisplay(responseText);
-            updateActiveMessages((current) =>
-              current.map((item) =>
-                item.id === assistantMessage.id ? { ...item, content: displayText } : item
-              )
-            );
+          const message = result.message || "MCP 工具调用失败";
+          setStatus(result.status === "completed" ? "idle" : "error");
+          updateActiveMessages((current) =>
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: message } : item))
+          );
+          await refreshExecutionLogs();
+          if (result.status === "completed") {
+            await playTts(message);
+          } else {
+            setError(message);
           }
+        } catch (mcpError) {
+          const message = String(mcpError);
+          await refreshExecutionLogs();
+          setError(message);
+          setStatus("error");
+          updateActiveMessages((current) =>
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: message } : item))
+          );
         }
-      });
-      if (cancelledChatRequestIdRef.current === requestId) {
-        setStatus("idle");
         return;
       }
 
-      const displayText = assistantTextForDisplay(responseText);
-      if (ttsEnabled) {
-        const speechText = speechTextFromAssistantText(displayText);
-        let audio: HTMLAudioElement | null = null;
-        if (speechText) {
-          try {
-            audio = await prepareCloudTtsAudio(speechText);
-          } catch (ttsError) {
-            setError(`${copy.ttsFailed}${String(ttsError)}`);
+      const plannedAction = imagesForMessage.length > 0 ? null : await planLocalAction(content);
+      if (plannedAction) {
+        const nextUserMessage = createMessage("user", content);
+        const assistantMessage = createMessage("assistant", "");
+
+        updateActiveMessages((current) => appendMessagePair(current, nextUserMessage, assistantMessage));
+        setInput("");
+        setError("");
+        setPendingConfirmation(null);
+        setStatus("executing");
+
+        try {
+          const response = await executeLocalAction(plannedAction, false);
+          if (response.status === "requiresConfirmation" && response.confirmation && response.action) {
+            setPendingConfirmation({
+              kind: "local",
+              action: response.action,
+              assistantMessageId: assistantMessage.id,
+              title: response.confirmation.title,
+              description: response.confirmation.description,
+              command: response.confirmation.command,
+              target: response.confirmation.target,
+              riskLevel: response.confirmation.riskLevel
+            });
+            setStatus("confirming");
+            updateActiveMessages((current) =>
+              current.map((item) =>
+                item.id === assistantMessage.id
+                  ? { ...item, content: `${copy.confirmationTitle}：${response.confirmation?.title}` }
+                  : item
+              )
+            );
+            return;
           }
+
+          setStatus(response.status === "completed" ? "idle" : "error");
+          updateActiveMessages((current) =>
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: response.message } : item))
+          );
+          await refreshExecutionLogs();
+          if (response.status === "completed") {
+            await playTts(response.message);
+          }
+        } catch (localActionError) {
+          const message = String(localActionError);
+          setError(message);
+          setStatus("error");
+          updateActiveMessages((current) =>
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: message } : item))
+          );
         }
-        updateActiveMessages((current) =>
-          current.map((item) => (item.id === assistantMessage.id ? { ...item, content: displayText } : item))
-        );
-        if (audio) {
-          try {
-            await playPreparedAudio(audio);
-          } catch (ttsError) {
-            setError(`${copy.ttsFailed}${String(ttsError)}`);
+        return;
+      }
+
+      const appendConfigurationErrorMessage = (errorCode: string) => {
+        const nextUserMessage = createMessage("user", content, imagesForMessage);
+        const assistantMessage = createMessage("assistant", chatErrorReply(errorCode, copy));
+        updateActiveMessages((current) => appendMessagePair(current, nextUserMessage, assistantMessage));
+        if (shouldClearComposer) {
+          setPendingImages([]);
+        }
+        setError(errorCode);
+        setStatus("error");
+      };
+
+      if (!config) {
+        appendConfigurationErrorMessage("missing_api_key");
+        return;
+      }
+
+      const activeTextProfile = selectedProfile(config, "text");
+      const activeVisionProfile = selectedProfile(config, "vision");
+      const activeProfile = imagesForMessage.length > 0 ? activeVisionProfile : activeTextProfile;
+      if (imagesForMessage.length > 0 && !activeVisionProfile) {
+        appendConfigurationErrorMessage("missing_vision_model");
+        return;
+      }
+      if (!activeProfile) {
+        appendConfigurationErrorMessage("missing_model_config");
+        return;
+      }
+      if (!activeProfile.baseUrl.trim() || !activeProfile.model.trim()) {
+        appendConfigurationErrorMessage("missing_model_config");
+        return;
+      }
+      if (!activeProfile.apiKey.trim()) {
+        appendConfigurationErrorMessage("missing_api_key");
+        return;
+      }
+
+      const nextUserMessage = createMessage("user", content, imagesForMessage);
+      const nextMessages = [...conversationRef.current.messages, nextUserMessage];
+      const assistantMessage = createMessage("assistant", "");
+      const requestId = crypto.randomUUID();
+
+      updateActiveMessages((current) => appendMessagePair(current, nextUserMessage, assistantMessage));
+      setInput("");
+      setPendingImages([]);
+      setError("");
+      cancelledChatRequestIdRef.current = "";
+      activeChatRequestIdRef.current = requestId;
+      setActiveChatRequestId(requestId);
+      setStatus("thinking");
+
+      try {
+        const ttsEnabled = Boolean(config?.voice.ttsEnabled);
+        const reasoningMode = await resolveReasoningMode(content);
+        const skillDocuments = await loadEnabledSkillRegistryDocuments();
+        setStatus("thinking");
+        let responseText = "";
+        await sendChatStream({
+          requestId,
+          reasoningMode,
+          messages: buildModelMessages(
+            config,
+            memories,
+            soulFileContent,
+            memoryFileContent,
+            buildRegistryContext(savedSkills, savedMcpServers, skillDocuments),
+            createConversationSummary(nextMessages, config.memory),
+            nextMessages
+          ),
+          onDelta: (chunk) => {
+            if (cancelledChatRequestIdRef.current === requestId) {
+              return;
+            }
+
+            responseText = `${responseText}${chunk}`;
+            if (!ttsEnabled) {
+              const displayText = assistantTextForDisplay(responseText);
+              updateActiveMessages((current) =>
+                current.map((item) =>
+                  item.id === assistantMessage.id ? { ...item, content: displayText } : item
+                )
+              );
+            }
+          }
+        });
+        if (cancelledChatRequestIdRef.current === requestId) {
+          setStatus("idle");
+          return;
+        }
+
+        const displayText = assistantTextForDisplay(responseText);
+        if (ttsEnabled) {
+          const speechText = speechTextFromAssistantText(displayText);
+          let audio: HTMLAudioElement | null = null;
+          if (speechText) {
+            try {
+              audio = await prepareCloudTtsAudio(speechText);
+            } catch (ttsError) {
+              setError(`${copy.ttsFailed}${String(ttsError)}`);
+            }
+          }
+          updateActiveMessages((current) =>
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: displayText } : item))
+          );
+          if (audio) {
+            try {
+              await playPreparedAudio(audio);
+            } catch (ttsError) {
+              setError(`${copy.ttsFailed}${String(ttsError)}`);
+              setStatus("idle");
+            }
+          } else {
             setStatus("idle");
           }
         } else {
+          updateActiveMessages((current) =>
+            current.map((item) => (item.id === assistantMessage.id ? { ...item, content: displayText } : item))
+          );
           setStatus("idle");
         }
-      } else {
-        updateActiveMessages((current) =>
-          current.map((item) => (item.id === assistantMessage.id ? { ...item, content: displayText } : item))
-        );
-        setStatus("idle");
-      }
-    } catch (chatError) {
-      const message = String(chatError);
-      if (message.includes("chat_cancelled") || cancelledChatRequestIdRef.current === requestId) {
-        setStatus("idle");
-        return;
-      }
+      } catch (chatError) {
+        const message = String(chatError);
+        if (message.includes("chat_cancelled") || cancelledChatRequestIdRef.current === requestId) {
+          setStatus("idle");
+          return;
+        }
 
-      setError(message);
-      setStatus("error");
-      updateActiveMessages((current) =>
-        current.map((item) =>
-          item.id === assistantMessage.id
-            ? {
-                ...item,
-                content:
-                  message === "missing_api_key"
-                    ? copy.missingApiReply
-                    : `${copy.chatFailurePrefix}${message}`
-          }
-            : item
-        )
-      );
-    } finally {
-      if (activeChatRequestIdRef.current === requestId) {
-        activeChatRequestIdRef.current = "";
-        setActiveChatRequestId("");
+        setError(message);
+        setStatus("error");
+        updateActiveMessages((current) =>
+          current.map((item) =>
+            item.id === assistantMessage.id
+              ? {
+                  ...item,
+                  content: chatErrorReply(message, copy)
+                }
+              : item
+          )
+        );
+      } finally {
+        if (activeChatRequestIdRef.current === requestId) {
+          activeChatRequestIdRef.current = "";
+          setActiveChatRequestId("");
+        }
       }
+    } finally {
+      if (activeSubmissionKeyRef.current === submissionKey) {
+        activeSubmissionKeyRef.current = "";
+      }
+      sendInFlightRef.current = false;
     }
   }
 
-  async function confirmPendingAction() {
+  async function confirmPendingAction(remember = false) {
     if (!pendingConfirmation) {
       return;
     }
 
     setStatus("executing");
     try {
-      const response = await executeLocalAction(pendingConfirmation.action, true);
+      const shouldRemember = remember && canRememberPermission(pendingConfirmation);
+      const response =
+        pendingConfirmation.kind === "mcp" && pendingConfirmation.request
+          ? await callMcpTool(pendingConfirmation.request, true, shouldRemember)
+          : await executeLocalAction(pendingConfirmation.action!, true, shouldRemember);
       updateActiveMessages((current) =>
         current.map((item) =>
           item.id === pendingConfirmation.assistantMessageId ? { ...item, content: response.message } : item
@@ -2310,6 +4287,9 @@ function App() {
       setPendingConfirmation(null);
       setStatus(response.status === "completed" ? "idle" : "error");
       await refreshExecutionLogs();
+      if (shouldRemember) {
+        await refreshPermissionRules();
+      }
       if (response.status === "completed") {
         await playTts(response.message);
       }
@@ -2325,18 +4305,57 @@ function App() {
     }
   }
 
-  function cancelPendingAction() {
+  function discardPendingConfirmation() {
     if (!pendingConfirmation) {
       return;
     }
 
+    const cancelledConfirmation = pendingConfirmation;
     updateActiveMessages((current) =>
       current.map((item) =>
-        item.id === pendingConfirmation.assistantMessageId ? { ...item, content: "已取消执行。" } : item
+        item.id === cancelledConfirmation.assistantMessageId ? { ...item, content: copy.cancelledExecution } : item
       )
     );
     setPendingConfirmation(null);
-    setStatus("idle");
+    setStatus((current) => (current === "confirming" ? "idle" : current));
+    setError("");
+
+    void writeExecutionLog({
+      actionType:
+        cancelledConfirmation.kind === "mcp"
+          ? "mcp_tool"
+          : cancelledConfirmation.action?.actionType || "local_action",
+      title: cancelledConfirmation.title,
+      target: cancelledConfirmation.command || cancelledConfirmation.target,
+      status: "cancelled",
+      riskLevel: cancelledConfirmation.riskLevel || "unknown",
+      reason: `${copy.cancelledReason}：${cancelledConfirmation.description || cancelledConfirmation.title}`
+    })
+      .then(() => refreshExecutionLogs())
+      .catch((logError) => {
+        setError(String(logError));
+        setStatus("error");
+      });
+  }
+
+  function stopTransientInteraction() {
+    clearVoiceAutoSendTimer();
+    if (speechProcessingRef.current) {
+      cancelSpeechProcessing();
+    } else if (statusRef.current === "listening" || speechRecognitionRef.current || mediaRecorderRef.current) {
+      stopListening();
+    }
+
+    if (activeChatRequestIdRef.current) {
+      void cancelModelResponse();
+      return;
+    }
+
+    stopTts();
+  }
+
+  async function cancelPendingAction() {
+    discardPendingConfirmation();
   }
 
   async function handleSaveSettings() {
@@ -2411,9 +4430,9 @@ function App() {
       <section
         className={`assistant-surface ${isExpanded ? "is-expanded" : "is-collapsed"}`}
         aria-label={copy.assistantAria}
-        onMouseEnter={() => setIsExpanded(true)}
+        onMouseEnter={previewExpandAssistant}
         onMouseLeave={() => {
-          if (!settingsOpen) {
+          if (!isExpandedPinned && !settingsOpen && status === "idle" && !speechProcessing) {
             setIsExpanded(false);
           }
         }}
@@ -2422,7 +4441,12 @@ function App() {
           <button
             className="orb-button"
             onClick={() => {
-              setIsExpanded(true);
+              if (isExpanded && isExpandedPinned && !settingsOpen && status === "idle" && !speechProcessing) {
+                setIsExpandedPinned(false);
+                setIsExpanded(false);
+                return;
+              }
+              pinExpandAssistant();
               window.setTimeout(() => inputRef.current?.focus(), 40);
             }}
             aria-label={copy.activate}
@@ -2437,7 +4461,14 @@ function App() {
             <strong>{copy.assistantName}</strong>
             <span>{copy.status[status]}</span>
           </div>
-          <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label={copy.openSettings}>
+          <button
+            className="icon-button"
+            onClick={() => {
+              pinExpandAssistant();
+              setSettingsOpen(true);
+            }}
+            aria-label={copy.openSettings}
+          >
             <Settings size={17} />
           </button>
           <button className="icon-button" onClick={() => void hideAssistantWindow()} aria-label={copy.hideWindow}>
@@ -2451,13 +4482,13 @@ function App() {
               <button
                 className="text-button"
                 onClick={resumePreviousConversation}
-                disabled={!previousConversation}
+                disabled={!previousConversation || status === "executing"}
                 title={previousConversation ? previousConversation.title : copy.noPreviousConversation}
               >
                 <ArrowLeft size={15} />
                 <span>{copy.previousConversation}</span>
               </button>
-              <button className="text-button" onClick={startNewConversation}>
+              <button className="text-button" onClick={startNewConversation} disabled={status === "executing"}>
                 <Plus size={15} />
                 <span>{copy.newConversation}</span>
               </button>
@@ -2472,11 +4503,37 @@ function App() {
                 </div>
               ) : (
                 <div className="message-stack">
-                  {visibleMessages.map((message) => (
-                    <article key={message.id} className={`message message-${message.role}`}>
-                      <span>{message.role === "user" ? copy.roles.user : copy.roles.assistant}</span>
-                      <p>{message.content || "..."}</p>
-                    </article>
+                  {visibleMessages.map((message, index) => (
+                    (() => {
+                      const contentSegments = parseMessageContent(message.content);
+                      return (
+                        <article key={`${message.id}-${index}`} className={`message message-${message.role}`}>
+                          <span>{message.role === "user" ? copy.roles.user : copy.roles.assistant}</span>
+                          {message.imageAttachments?.length ? (
+                            <div className="message-images">
+                              {message.imageAttachments.map((image) => (
+                                <img key={image.id} src={image.dataUrl} alt={image.name || copy.imageAttachmentLabel} />
+                              ))}
+                            </div>
+                          ) : null}
+                          {contentSegments.length > 0 ? (
+                            contentSegments.map((segment, segmentIndex) =>
+                              segment.type === "text" ? (
+                                <p key={`${message.id}-text-${segmentIndex}`} className="message-bubble">
+                                  {segment.content}
+                                </p>
+                              ) : (
+                                <div key={`${message.id}-image-${segmentIndex}`} className="message-inline-images">
+                                  <img src={segment.src} alt={segment.alt || copy.imageAttachmentLabel} />
+                                </div>
+                              )
+                            )
+                          ) : (
+                            <p className="message-bubble">...</p>
+                          )}
+                        </article>
+                      );
+                    })()
                   ))}
                 </div>
               )}
@@ -2506,9 +4563,18 @@ function App() {
                   {pendingConfirmation.target && !pendingConfirmation.command ? <code>{pendingConfirmation.target}</code> : null}
                 </div>
                 <div className="confirmation-actions">
-                  <button className="secondary-button dark-surface" onClick={cancelPendingAction} type="button">
+                  <button className="secondary-button dark-surface" onClick={() => void cancelPendingAction()} type="button">
                     {copy.cancel}
                   </button>
+                  {canRememberPermission(pendingConfirmation) ? (
+                    <button
+                      className="secondary-button dark-surface"
+                      onClick={() => void confirmPendingAction(true)}
+                      type="button"
+                    >
+                      {copy.rememberAllow}
+                    </button>
+                  ) : null}
                   <button className="primary-button light-surface" onClick={() => void confirmPendingAction()} type="button">
                     <Check size={15} />
                     <span>{copy.allowOnce}</span>
@@ -2517,14 +4583,62 @@ function App() {
               </div>
             ) : null}
 
-            <div className="input-row">
+            <div
+              className="input-composer"
+              onDragOver={(event) => {
+                if (Array.from(event.dataTransfer.items).some((item) => item.type.startsWith("image/"))) {
+                  event.preventDefault();
+                }
+              }}
+              onDrop={handleImageDrop}
+            >
+              {pendingImages.length > 0 ? (
+                <div className="pending-images">
+                  {pendingImages.map((image) => (
+                    <div key={image.id} className="pending-image">
+                      <img src={image.dataUrl} alt={image.name || copy.imageAttachmentLabel} />
+                      <button
+                        type="button"
+                        aria-label={copy.removeImage}
+                        disabled={status === "executing"}
+                        onClick={() => {
+                          clearVoiceAutoSendTimer();
+                          setPendingImages((current) => current.filter((item) => item.id !== image.id));
+                        }}
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <div className="input-row">
+              <input
+                ref={imageInputRef}
+                className="image-input"
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/webp"
+                multiple
+                disabled={status === "executing"}
+                onChange={handleImageInputChange}
+              />
+              <button
+                className="attach-button"
+                onClick={() => imageInputRef.current?.click()}
+                type="button"
+                disabled={status === "executing"}
+                aria-label={copy.attachImage}
+              >
+                <ImagePlus size={18} />
+              </button>
               <button
                 className={`mic-button ${voiceBusy ? "is-active" : ""}`}
-                onPointerDown={voiceBusy ? undefined : startMicHold}
-                onPointerUp={voiceBusy ? undefined : stopMicHold}
-                onPointerCancel={voiceBusy ? undefined : stopMicHold}
-                onPointerLeave={voiceBusy ? undefined : stopMicHold}
-                onClick={toggleNativeSpeechRecognition}
+                onPointerDown={voiceBusy || !speechInputAvailable ? undefined : startMicHold}
+                onPointerUp={voiceBusy || !speechInputAvailable ? undefined : stopMicHold}
+                onPointerCancel={voiceBusy || !speechInputAvailable ? undefined : stopMicHold}
+                onPointerLeave={voiceBusy || !speechInputAvailable ? undefined : stopMicHold}
+                onClick={status === "executing" || !speechInputAvailable ? undefined : toggleNativeSpeechRecognition}
+                disabled={status === "executing" || !speechInputAvailable}
                 aria-label={voiceBusy ? copy.stopVoice : copy.testStt}
               >
                 {voiceBusy ? <X size={18} /> : <Mic size={18} />}
@@ -2532,11 +4646,16 @@ function App() {
               <textarea
                 ref={inputRef}
                 value={input}
-                onChange={(event) => setInput(event.target.value)}
+                disabled={status === "executing"}
+                onChange={(event) => {
+                  clearVoiceAutoSendTimer();
+                  setInput(event.target.value);
+                }}
+                onPaste={handleInputPaste}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
-                    void handleSend();
+                    void handleSend(undefined, { includePendingImages: true, bypassCooldown: true });
                   }
                 }}
                 placeholder={copy.inputPlaceholder}
@@ -2551,11 +4670,13 @@ function App() {
                   }
                   void handleSend();
                 }}
-                disabled={!activeChatRequestId && !input.trim()}
-                aria-label={activeChatRequestId ? copy.stopVoice : undefined}
+                disabled={status === "executing" || (!activeChatRequestId && !input.trim() && pendingImages.length === 0)}
+                aria-label={activeChatRequestId ? copy.stopReply : undefined}
+                title={activeChatRequestId ? copy.stopReply : undefined}
               >
                 {activeChatRequestId ? <X size={17} /> : <Send size={17} />}
               </button>
+              </div>
             </div>
           </div>
         ) : null}
@@ -2606,6 +4727,7 @@ function App() {
               logSearch={logSearch}
               logStatusFilter={logStatusFilter}
               logRiskFilter={logRiskFilter}
+              permissionRules={permissionRules}
               memories={memories}
               memoryDraft={memoryDraft}
               memoryFileContent={memoryFileContent}
@@ -2615,14 +4737,16 @@ function App() {
               soulFileDraft={soulFileDraft}
               soulFilePath={soulFilePath}
               pendingMemoryFileSave={pendingMemoryFileSave}
-              skills={skills}
+              skills={draftSkills}
               skillDraft={skillDraft}
-              mcpServers={mcpServers}
+              mcpServers={draftMcpServers}
               mcpDraft={mcpDraft}
+              mcpCheckingId={mcpCheckingId}
               sttTestResult={sttTestResult}
               ttsTestResult={ttsTestResult}
               capturingGlobalShortcut={capturingGlobalShortcut}
               capturingPushToTalkKey={capturingPushToTalkKey}
+              conversationBusy={status === "executing"}
               resumeConversation={resumeConversation}
               requestMemoryFileSave={setPendingMemoryFileSave}
               confirmMemoryFileSave={confirmMemoryFileSave}
@@ -2653,21 +4777,49 @@ function App() {
               }}
               setSkillDraft={setSkillDraft}
               addSkill={addSkillEntry}
+              updateSkill={(id, patch) => updateSkillEntry(id, patch)}
+              toggleTrustedSkill={toggleTrustedSkill}
               toggleSkill={(id) =>
-                updateSkills(skills.map((skill) => (skill.id === id ? { ...skill, enabled: !skill.enabled } : skill)))
-              }
-              setMcpDraft={setMcpDraft}
-              addMcp={addMcpEntry}
-              toggleMcp={(id) =>
-                updateMcpServers(
-                  mcpServers.map((server) => (server.id === id ? { ...server, enabled: !server.enabled } : server))
+                updateDraftSkills((current) =>
+                  current.map((skill) => (skill.id === id ? { ...skill, enabled: !skill.enabled } : skill))
                 )
               }
+              deleteSkill={(id) => {
+                const skill = draftSkills.find((item) => item.id === id);
+                updateDraftSkills((current) => current.filter((item) => item.id !== id));
+                if (skill?.path) {
+                  updateDraft((current) => ({
+                    ...current,
+                    permissions: {
+                      ...current.permissions,
+                      trustedSkills: current.permissions.trustedSkills.filter((path) => path.trim() !== skill.path.trim())
+                    }
+                  }));
+                }
+              }}
+              setMcpDraft={setMcpDraft}
+              addMcp={addMcpEntry}
+              updateMcp={(id, patch) => updateMcpEntry(id, patch)}
+              inspectMcp={(id) => void inspectMcpEntry(id)}
+              toggleMcp={toggleMcpEntry}
+              deleteMcp={(id) => updateDraftMcpServers((current) => current.filter((server) => server.id !== id))}
               testSpeechRecognition={testSpeechRecognition}
               testTtsPlayback={testTtsPlayback}
               stopVoice={() => {
                 cancelSpeechProcessing();
                 stopTts();
+              }}
+              deleteConversation={(id) => void removeConversation(id)}
+              clearConversations={() => void removeAllConversations()}
+              clearExecutionLogs={() => void removeAllExecutionLogs()}
+              deleteExecutionLog={(id) => void removeExecutionLog(id)}
+              deletePermissionRule={async (id) => {
+                await deletePermissionRule(id);
+                await refreshPermissionRules();
+              }}
+              clearPermissionRules={async () => {
+                await clearPermissionRules();
+                await refreshPermissionRules();
               }}
               updateDraft={updateDraft}
             />
@@ -2698,6 +4850,7 @@ interface SettingsSectionProps {
   logSearch: string;
   logStatusFilter: string;
   logRiskFilter: string;
+  permissionRules: PermissionRule[];
   memories: MemoryItem[];
   memoryDraft: string;
   memoryFileContent: string;
@@ -2707,14 +4860,16 @@ interface SettingsSectionProps {
   soulFileDraft: string;
   soulFilePath: string;
   pendingMemoryFileSave: MemoryFileKind | null;
-  skills: SkillEntry[];
+  skills: SkillRegistryEntry[];
   skillDraft: string;
-  mcpServers: McpEntry[];
+  mcpServers: McpRegistryEntry[];
   mcpDraft: string;
+  mcpCheckingId: string;
   sttTestResult: string;
   ttsTestResult: string;
   capturingGlobalShortcut: boolean;
   capturingPushToTalkKey: boolean;
+  conversationBusy: boolean;
   resumeConversation: (sessionId: string) => void;
   requestMemoryFileSave: (kind: MemoryFileKind) => void;
   confirmMemoryFileSave: () => Promise<void>;
@@ -2732,13 +4887,25 @@ interface SettingsSectionProps {
   clearMemories: () => Promise<void>;
   setSkillDraft: (value: string) => void;
   addSkill: () => void;
+  updateSkill: (id: string, patch: { name?: string; path?: string }) => void;
+  toggleTrustedSkill: (path: string) => void;
   toggleSkill: (id: string) => void;
+  deleteSkill: (id: string) => void;
   setMcpDraft: (value: string) => void;
   addMcp: () => void;
+  updateMcp: (id: string, patch: { name?: string; command?: string }) => void;
+  inspectMcp: (id: string) => void;
   toggleMcp: (id: string) => void;
+  deleteMcp: (id: string) => void;
   testSpeechRecognition: () => void;
   testTtsPlayback: () => void;
   stopVoice: () => void;
+  deleteConversation: (id: string) => void;
+  clearConversations: () => void;
+  clearExecutionLogs: () => void;
+  deleteExecutionLog: (id: string) => void;
+  deletePermissionRule: (id: string) => Promise<void>;
+  clearPermissionRules: () => Promise<void>;
   updateDraft: (updater: (current: AppConfig) => AppConfig) => void;
 }
 
@@ -2752,6 +4919,7 @@ function SettingsSection({
   logSearch,
   logStatusFilter,
   logRiskFilter,
+  permissionRules,
   memories,
   memoryDraft,
   memoryFileContent,
@@ -2765,10 +4933,12 @@ function SettingsSection({
   skillDraft,
   mcpServers,
   mcpDraft,
+  mcpCheckingId,
   sttTestResult,
   ttsTestResult,
   capturingGlobalShortcut,
   capturingPushToTalkKey,
+  conversationBusy,
   resumeConversation,
   requestMemoryFileSave,
   confirmMemoryFileSave,
@@ -2786,13 +4956,25 @@ function SettingsSection({
   clearMemories,
   setSkillDraft,
   addSkill,
+  updateSkill,
+  toggleTrustedSkill,
   toggleSkill,
+  deleteSkill,
   setMcpDraft,
   addMcp,
+  updateMcp,
+  inspectMcp,
   toggleMcp,
+  deleteMcp,
   testSpeechRecognition,
   testTtsPlayback,
   stopVoice,
+  deleteConversation,
+  clearConversations,
+  clearExecutionLogs,
+  deleteExecutionLog,
+  deletePermissionRule,
+  clearPermissionRules,
   updateDraft
 }: SettingsSectionProps) {
   const [shortcutOptionsOpen, setShortcutOptionsOpen] = useState(false);
@@ -2921,6 +5103,24 @@ function SettingsSection({
   }
 
   if (active === "models") {
+    const textCapableProfiles = profiles.filter((profile) => profile.capabilities.includes("text"));
+    const resolveSelectedProfileId = (
+      nextProfiles: ModelProfile[],
+      capability: ModelProfileKind,
+      currentSelectedId: string,
+      removedProfileId?: string
+    ) => {
+      if (currentSelectedId && currentSelectedId !== removedProfileId) {
+        const currentSelected = nextProfiles.find(
+          (profile) => profile.id === currentSelectedId && profile.capabilities.includes(capability)
+        );
+        if (currentSelected) {
+          return currentSelected.id;
+        }
+      }
+      return nextProfiles.find((profile) => profile.capabilities.includes(capability))?.id || "";
+    };
+
     const updateProfile = (profileId: string, updater: (profile: ModelProfile) => ModelProfile) => {
       updateDraft((current) => ({
         ...current,
@@ -2932,16 +5132,92 @@ function SettingsSection({
     };
 
     const updateProfileCapability = (profile: ModelProfile, kind: ModelProfileKind, enabled: boolean) => {
+      if (!enabled && kind === "text" && profile.capabilities.includes("text") && textCapableProfiles.length === 1) {
+        return;
+      }
+
       const nextCapabilities = enabled
         ? Array.from(new Set([...profile.capabilities, kind]))
         : profile.capabilities.filter((capability) => capability !== kind);
       const capabilities = nextCapabilities.length > 0 ? nextCapabilities : [kind];
+      updateDraft((current) => {
+        const nextProfiles = current.models.profiles.map((item) =>
+          item.id === profile.id
+            ? {
+                ...item,
+                capabilities,
+                kind: capabilities[0]
+              }
+            : item
+        );
 
-      updateProfile(profile.id, (item) => ({
-        ...item,
-        capabilities,
-        kind: capabilities[0]
-      }));
+        const selectIfEmpty = (capability: ModelProfileKind, currentSelectedId: string) => {
+          if (enabled && kind === capability && !currentSelectedId && capabilities.includes(capability)) {
+            return profile.id;
+          }
+          return resolveSelectedProfileId(nextProfiles, capability, currentSelectedId);
+        };
+
+        const nextSelectedTtsProfileId = selectIfEmpty("tts", current.models.selectedTtsProfileId);
+
+        return {
+          ...current,
+          voice: {
+            ...current.voice,
+            ttsEnabled: nextSelectedTtsProfileId ? current.voice.ttsEnabled : false
+          },
+          models: {
+            ...current.models,
+            profiles: nextProfiles,
+            selectedTextProfileId: selectIfEmpty("text", current.models.selectedTextProfileId),
+            selectedVisionProfileId: selectIfEmpty("vision", current.models.selectedVisionProfileId),
+            selectedTtsProfileId: nextSelectedTtsProfileId,
+            selectedSttProfileId: selectIfEmpty("stt", current.models.selectedSttProfileId)
+          }
+        };
+      });
+    };
+
+    const deleteProfile = (profileId: string) => {
+      updateDraft((current) => {
+        const nextProfiles = current.models.profiles.filter((profile) => profile.id !== profileId);
+        const nextSelectedTtsProfileId = resolveSelectedProfileId(
+          nextProfiles,
+          "tts",
+          current.models.selectedTtsProfileId,
+          profileId
+        );
+        return {
+          ...current,
+          voice: {
+            ...current.voice,
+            ttsEnabled: nextSelectedTtsProfileId ? current.voice.ttsEnabled : false
+          },
+          models: {
+            ...current.models,
+            profiles: nextProfiles,
+            selectedTextProfileId: resolveSelectedProfileId(
+              nextProfiles,
+              "text",
+              current.models.selectedTextProfileId,
+              profileId
+            ),
+            selectedVisionProfileId: resolveSelectedProfileId(
+              nextProfiles,
+              "vision",
+              current.models.selectedVisionProfileId,
+              profileId
+            ),
+            selectedTtsProfileId: nextSelectedTtsProfileId,
+            selectedSttProfileId: resolveSelectedProfileId(
+              nextProfiles,
+              "stt",
+              current.models.selectedSttProfileId,
+              profileId
+            )
+          }
+        };
+      });
     };
 
     return (
@@ -2988,6 +5264,10 @@ function SettingsSection({
               onChange={(event) =>
                 updateDraft((current) => ({
                   ...current,
+                  voice: {
+                    ...current.voice,
+                    ttsEnabled: event.target.value ? current.voice.ttsEnabled : false
+                  },
                   models: { ...current.models, selectedTtsProfileId: event.target.value }
                 }))
               }
@@ -3021,84 +5301,104 @@ function SettingsSection({
         </div>
 
         <div className="model-add-row">
-          <button className="model-add-button" onClick={() => addProfileWithKind("text")} type="button">
-            <Plus size={15} />
-            <span>{copy.addModel}</span>
-          </button>
+          {(["text", "vision", "tts", "stt"] as const).map((kind) => (
+            <button key={kind} className="model-add-button" onClick={() => addProfileWithKind(kind)} type="button">
+              <Plus size={15} />
+              <span>
+                {copy.addModel} {copy.modelKinds[kind]}
+              </span>
+            </button>
+          ))}
         </div>
 
         <div className="model-profile-list">
-          {profiles.map((profile) => (
-            <section key={profile.id} className="model-profile-card">
-              <div className="model-profile-header">
-                <strong>{profile.name || copy.labels.profileName}</strong>
-                <div className="model-capability-tags">
-                  {profile.capabilities.map((capability) => (
-                    <span key={capability}>{copy.modelKinds[capability]}</span>
-                  ))}
-                </div>
-              </div>
-              <div className="model-profile-fields">
-                <Field label={copy.labels.profileName}>
-                  <input
-                    value={profile.name}
-                    onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, name: event.target.value }))}
-                  />
-                </Field>
-                <div className="field">
-                  <span>{copy.labels.profileKind}</span>
-                  <div className="model-capability-picker">
-                    {(["text", "vision", "tts", "stt"] as const).map((capability) => (
-                      <button
-                        key={capability}
-                        className={profile.capabilities.includes(capability) ? "is-selected" : ""}
-                        type="button"
-                        onClick={() =>
-                          updateProfileCapability(profile, capability, !profile.capabilities.includes(capability))
-                        }
-                      >
-                        {profile.capabilities.includes(capability) ? <Check size={14} /> : <Plus size={13} />}
-                        <span>{copy.modelKinds[capability]}</span>
-                      </button>
-                    ))}
+          {profiles.map((profile) => {
+            const deleteDisabled = profile.capabilities.includes("text") && textCapableProfiles.length === 1;
+
+            return (
+              <section key={profile.id} className="model-profile-card">
+                <div className="model-profile-header">
+                  <div>
+                    <strong>{profile.name || copy.labels.profileName}</strong>
+                    <div className="model-capability-tags">
+                      {profile.capabilities.map((capability) => (
+                        <span key={capability}>{copy.modelKinds[capability]}</span>
+                      ))}
+                    </div>
                   </div>
+                  <button
+                    className="registry-delete"
+                    onClick={() => deleteProfile(profile.id)}
+                    type="button"
+                    aria-label={copy.deleteModel}
+                    disabled={deleteDisabled}
+                    title={copy.deleteModel}
+                  >
+                    <X size={14} />
+                  </button>
                 </div>
-                <Field label={copy.labels.provider}>
-                  <input
-                    value={profile.provider}
-                    onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, provider: event.target.value }))}
-                  />
-                </Field>
-                <Field label={copy.labels.apiBaseUrl}>
-                  <input
-                    value={profile.baseUrl}
-                    onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, baseUrl: event.target.value }))}
-                  />
-                </Field>
-                <Field label={copy.labels.model}>
-                  <input
-                    value={profile.model}
-                    onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, model: event.target.value }))}
-                  />
-                </Field>
-                {profile.capabilities.includes("tts") ? (
-                  <Field label={copy.labels.voice}>
+                <div className="model-profile-fields">
+                  <Field label={copy.labels.profileName}>
                     <input
-                      value={profile.voice || ""}
-                      onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, voice: event.target.value }))}
+                      value={profile.name}
+                      onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, name: event.target.value }))}
                     />
                   </Field>
-                ) : null}
-                <Field label={copy.labels.apiKey}>
-                  <input
-                    type="password"
-                    value={profile.apiKey}
-                    onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, apiKey: event.target.value }))}
-                  />
-                </Field>
-              </div>
-            </section>
-          ))}
+                  <div className="field">
+                    <span>{copy.labels.profileKind}</span>
+                    <div className="model-capability-picker">
+                      {(["text", "vision", "tts", "stt"] as const).map((capability) => (
+                        <button
+                          key={capability}
+                          className={profile.capabilities.includes(capability) ? "is-selected" : ""}
+                          type="button"
+                          onClick={() =>
+                            updateProfileCapability(profile, capability, !profile.capabilities.includes(capability))
+                          }
+                        >
+                          {profile.capabilities.includes(capability) ? <Check size={14} /> : <Plus size={13} />}
+                          <span>{copy.modelKinds[capability]}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <Field label={copy.labels.provider}>
+                    <input
+                      value={profile.provider}
+                      onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, provider: event.target.value }))}
+                    />
+                  </Field>
+                  <Field label={copy.labels.apiBaseUrl}>
+                    <input
+                      value={profile.baseUrl}
+                      onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, baseUrl: event.target.value }))}
+                    />
+                  </Field>
+                  <Field label={copy.labels.model}>
+                    <input
+                      value={profile.model}
+                      onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, model: event.target.value }))}
+                    />
+                  </Field>
+                  {profile.capabilities.includes("tts") ? (
+                    <Field label={copy.labels.voice}>
+                      <input
+                        value={profile.voice || ""}
+                        onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, voice: event.target.value }))}
+                      />
+                    </Field>
+                  ) : null}
+                  <Field label={copy.labels.apiKey}>
+                    <input
+                      type="password"
+                      value={profile.apiKey}
+                      onChange={(event) => updateProfile(profile.id, (item) => ({ ...item, apiKey: event.target.value }))}
+                    />
+                  </Field>
+                </div>
+              </section>
+            );
+          })}
         </div>
       </div>
     );
@@ -3106,6 +5406,7 @@ function SettingsSection({
 
   if (active === "speech") {
     const sttProfiles = profileOptions("stt");
+    const selectedSttProfile = selectedProfile(config, "stt");
 
     return (
       <div className="settings-card">
@@ -3113,10 +5414,21 @@ function SettingsSection({
           <select
             value={config.voice.sttMode}
             onChange={(event) =>
-              updateDraft((current) => ({
-                ...current,
-                voice: { ...current.voice, sttMode: event.target.value as AppConfig["voice"]["sttMode"] }
-              }))
+              updateDraft((current) => {
+                const nextMode = event.target.value as AppConfig["voice"]["sttMode"];
+                const nextSelectedSttProfileId =
+                  nextMode === "model" && !current.models.selectedSttProfileId
+                    ? current.models.profiles.find((profile) => profile.capabilities.includes("stt"))?.id || ""
+                    : current.models.selectedSttProfileId;
+                return {
+                  ...current,
+                  voice: { ...current.voice, sttMode: nextMode },
+                  models: {
+                    ...current.models,
+                    selectedSttProfileId: nextSelectedSttProfileId
+                  }
+                };
+              })
             }
           >
             <option value="local">{copy.sttModes.local}</option>
@@ -3204,7 +5516,12 @@ function SettingsSection({
         </Field>
         <div className="voice-test-panel">
           <div className="voice-test-row">
-            <button className="secondary-button" onClick={testSpeechRecognition} type="button">
+            <button
+              className="secondary-button"
+              onClick={testSpeechRecognition}
+              type="button"
+              disabled={config.voice.sttMode === "model" && !selectedSttProfile}
+            >
               <Mic size={15} />
               <span>{copy.testStt}</span>
             </button>
@@ -3220,29 +5537,52 @@ function SettingsSection({
   }
 
   if (active === "sound") {
+    const ttsProfiles = profileOptions("tts");
+    const selectedTtsProfile = selectedProfile(config, "tts");
+    const hasLegacyTtsConfig =
+      ttsProfiles.length === 0 &&
+      Boolean(config.models.tts.baseUrl.trim() || config.models.tts.apiKeyRef.trim());
+
     return (
       <div className="settings-card">
-        <Field label={copy.labels.ttsModelSelect}>
-          <select
-            value={config.models.selectedTtsProfileId}
-            onChange={(event) =>
-              updateDraft((current) => ({
-                ...current,
-                models: { ...current.models, selectedTtsProfileId: event.target.value }
-              }))
-            }
-          >
-            <option value="">{copy.labels.noModelSelected}</option>
-            {profileOptions("tts").map((profile) => (
-              <option key={profile.id} value={profile.id}>
-                {profile.name}
-              </option>
-            ))}
-          </select>
-        </Field>
+        {ttsProfiles.length > 0 ? (
+          <Field label={copy.labels.ttsModelSelect}>
+            <select
+              value={config.models.selectedTtsProfileId}
+              onChange={(event) =>
+                updateDraft((current) => ({
+                  ...current,
+                  voice: {
+                    ...current.voice,
+                    ttsEnabled: event.target.value ? current.voice.ttsEnabled : false
+                  },
+                  models: { ...current.models, selectedTtsProfileId: event.target.value }
+                }))
+              }
+            >
+              <option value="">{copy.labels.noModelSelected}</option>
+              {ttsProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        ) : (
+          <div className="inline-empty">
+            <strong>{copy.labels.ttsModelSelect}</strong>
+            <p>{copy.ttsNoProfileCopy}</p>
+            {hasLegacyTtsConfig ? <p>{copy.ttsLegacyConfigHint}</p> : null}
+            <button className="secondary-button" onClick={() => addProfileWithKind("tts")} type="button">
+              <Plus size={15} />
+              <span>{copy.createTtsProfile}</span>
+            </button>
+          </div>
+        )}
         <Toggle
           label={copy.labels.ttsReplies}
           checked={config.voice.ttsEnabled}
+          disabled={!selectedTtsProfile}
           onChange={(checked) =>
             updateDraft((current) => ({
               ...current,
@@ -3252,7 +5592,7 @@ function SettingsSection({
         />
         <div className="voice-test-panel">
           <div className="voice-test-row">
-            <button className="secondary-button" onClick={testTtsPlayback} type="button">
+            <button className="secondary-button" onClick={testTtsPlayback} type="button" disabled={!selectedTtsProfile}>
               <Volume2 size={15} />
               <span>{copy.testTts}</span>
             </button>
@@ -3268,8 +5608,11 @@ function SettingsSection({
   }
 
   if (active === "permissions") {
+    const savedRules = permissionRules.filter((rule) => rule.decision === "allow");
+
     return (
       <div className="settings-card">
+        <p className="registry-help">{copy.permissionsHelp}</p>
         <Toggle
           label={copy.labels.allowShell}
           checked={config.permissions.allowShell}
@@ -3291,6 +5634,7 @@ function SettingsSection({
           }
         />
         <Field label={copy.labels.blockedPaths}>
+          <p className="registry-help">{copy.blockedPathsHelp}</p>
           <textarea
             value={config.permissions.blockedPaths.join("\n")}
             onChange={(event) =>
@@ -3298,20 +5642,69 @@ function SettingsSection({
                 ...current,
                 permissions: {
                   ...current.permissions,
-                  blockedPaths: event.target.value.split("\n").filter(Boolean)
+                  blockedPaths: event.target.value
+                    .split("\n")
+                    .map((value) => value.trim())
+                    .filter(Boolean)
                 }
               }))
             }
             rows={5}
           />
         </Field>
+        <div className="permission-rules-section">
+          <div className="memory-file-header">
+            <div>
+              <strong>{copy.savedRulesTitle}</strong>
+            </div>
+            <div className="memory-file-actions">
+              <button
+                className="secondary-button danger-button"
+                onClick={() => void clearPermissionRules()}
+                type="button"
+                disabled={savedRules.length === 0}
+              >
+                {copy.clearPermissionRules}
+              </button>
+            </div>
+          </div>
+          {savedRules.length === 0 ? (
+            <div className="inline-empty">
+              <p>{copy.savedRulesEmpty}</p>
+            </div>
+          ) : (
+            <div className="registry-list">
+              {savedRules.map((rule) => (
+                <article key={rule.id} className="registry-item">
+                  <div>
+                    <strong>{permissionRuleTitle(rule.actionType)}</strong>
+                    <code>{displayPermissionTarget(rule.target)}</code>
+                  </div>
+                  <div className="registry-actions">
+                    <button
+                      className="registry-delete"
+                      onClick={() => void deletePermissionRule(rule.id)}
+                      type="button"
+                      aria-label={copy.deletePermissionRule}
+                      title={copy.deletePermissionRule}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     );
   }
 
   if (active === "skills") {
+    const trustedPaths = trustedSkillPaths(config);
     return (
       <div className="settings-card registry-card">
+        <p className="registry-help">{copy.trustedSkillHelp}</p>
         <div className="registry-input-row">
           <input
             value={skillDraft}
@@ -3328,9 +5721,29 @@ function SettingsSection({
             id: skill.id,
             title: skill.name,
             detail: skill.path,
-            enabled: skill.enabled
+            enabled: skill.enabled,
+            titlePlaceholder: copy.registryNamePlaceholder,
+            detailPlaceholder: copy.skillPathPlaceholder,
+            titleAriaLabel: copy.registryNamePlaceholder,
+            detailAriaLabel: copy.skillPathPlaceholder,
+            trusted: trustedPaths.has(skill.path.trim()),
+            trustedLabel: copy.trustedSkill,
+            trustedDescription: trustedPaths.has(skill.path.trim()) ? "" : copy.trustedSkillOnlyMeta
           }))}
+          onUpdate={(id, patch) =>
+            updateSkill(id, {
+              ...(patch.title !== undefined ? { name: patch.title } : {}),
+              ...(patch.detail !== undefined ? { path: patch.detail } : {})
+            })
+          }
+          onToggleTrusted={(id) => {
+            const skill = skills.find((item) => item.id === id);
+            if (skill?.path) {
+              toggleTrustedSkill(skill.path);
+            }
+          }}
           onToggle={toggleSkill}
+          onDelete={deleteSkill}
         />
       </div>
     );
@@ -3355,9 +5768,27 @@ function SettingsSection({
             id: server.id,
             title: server.name,
             detail: server.command,
-            enabled: server.enabled
+            enabled: server.enabled,
+            titlePlaceholder: copy.registryNamePlaceholder,
+            detailPlaceholder: copy.mcpCommandPlaceholder,
+            titleAriaLabel: copy.registryNamePlaceholder,
+            detailAriaLabel: copy.mcpCommandPlaceholder,
+            tools: server.tools,
+            error: server.toolError
           }))}
+          onUpdate={(id, patch) =>
+            updateMcp(id, {
+              ...(patch.title !== undefined ? { name: patch.title } : {}),
+              ...(patch.detail !== undefined ? { command: patch.detail } : {})
+            })
+          }
           onToggle={toggleMcp}
+          onDelete={deleteMcp}
+          onInspect={inspectMcp}
+          inspectingId={mcpCheckingId}
+          inspectLabel={copy.inspectMcp}
+          inspectingLabel={copy.inspectingMcp}
+          toolsLabel={copy.mcpToolsLabel}
         />
       </div>
     );
@@ -3392,6 +5823,13 @@ function SettingsSection({
           label={copy.labels.longTermMemories}
           value={config.memory.maxLongTermMemories}
           field="maxLongTermMemories"
+          updateDraft={updateDraft}
+        />
+        <NumberField
+          label={copy.labels.injectedMemories}
+          value={config.memory.maxInjectedMemories}
+          field="maxInjectedMemories"
+          min={0}
           updateDraft={updateDraft}
         />
         <div className="memory-file-grid">
@@ -3557,6 +5995,9 @@ function SettingsSection({
             ))}
           </select>
         </div>
+        <button className="secondary-button danger-button" onClick={clearExecutionLogs} type="button">
+          {copy.clearLogs}
+        </button>
         {filteredLogs.length === 0 ? (
           <div className="inline-empty">
             <strong>{copy.noFilteredLogsTitle}</strong>
@@ -3572,14 +6013,25 @@ function SettingsSection({
                   {log.target ? <code>{log.target}</code> : null}
                   {log.reason ? <p>{log.reason}</p> : null}
                 </div>
-                <time>
-                  {new Intl.DateTimeFormat(undefined, {
-                    month: "2-digit",
-                    day: "2-digit",
-                    hour: "2-digit",
-                    minute: "2-digit"
-                  }).format(new Date(log.createdAt))}
-                </time>
+                <div className="log-item-actions">
+                  <time>
+                    {new Intl.DateTimeFormat(undefined, {
+                      month: "2-digit",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit"
+                    }).format(new Date(log.createdAt))}
+                  </time>
+                  <button
+                    className="registry-delete"
+                    onClick={() => deleteExecutionLog(log.id)}
+                    type="button"
+                    aria-label={copy.deleteLog}
+                    title={copy.deleteLog}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
               </article>
             ))}
           </div>
@@ -3603,32 +6055,44 @@ function SettingsSection({
 
     return (
       <div className="settings-card history-list">
+        <button className="secondary-button danger-button" onClick={clearConversations} type="button" disabled={conversationBusy}>
+          {copy.clearHistory}
+        </button>
         {sessionsWithMessages.map((session) => (
-          <button
-            key={session.id}
-            className={`history-item ${session.id === activeSessionId ? "is-active" : ""}`}
-            onClick={() => resumeConversation(session.id)}
-          >
-            <strong>{session.title}</strong>
-            <span>
-              {new Intl.DateTimeFormat(undefined, {
-                month: "2-digit",
-                day: "2-digit",
-                hour: "2-digit",
-                minute: "2-digit"
-              }).format(new Date(session.updatedAt))}
-            </span>
-            <em>{copy.continueConversation}</em>
-          </button>
+          <article key={session.id} className={`history-item ${session.id === activeSessionId ? "is-active" : ""}`}>
+            <button className="history-item-main" onClick={() => resumeConversation(session.id)} type="button" disabled={conversationBusy}>
+              <strong>{session.title}</strong>
+              <span>
+                {new Intl.DateTimeFormat(undefined, {
+                  month: "2-digit",
+                  day: "2-digit",
+                  hour: "2-digit",
+                  minute: "2-digit"
+                }).format(new Date(session.updatedAt))}
+              </span>
+              <em>{copy.continueConversation}</em>
+            </button>
+            <button
+              className="registry-delete"
+              onClick={() => deleteConversation(session.id)}
+              type="button"
+              disabled={conversationBusy}
+              aria-label={copy.deleteConversation}
+              title={copy.deleteConversation}
+            >
+              <X size={14} />
+            </button>
+          </article>
         ))}
       </div>
     );
   }
 
-  const placeholderMap: Record<string, { icon: typeof Bell; title: string; copy: string }> = {
+  const placeholder = {
+    icon: Bell,
+    title: copy.settings,
+    copy: copy.unavailableSectionCopy
   };
-
-  const placeholder = placeholderMap[active];
   const Icon = placeholder.icon;
 
   return (
@@ -3660,11 +6124,39 @@ interface RegistryListProps {
     title: string;
     detail: string;
     enabled: boolean;
+    titlePlaceholder?: string;
+    detailPlaceholder?: string;
+    titleAriaLabel?: string;
+    detailAriaLabel?: string;
+    trusted?: boolean;
+    trustedLabel?: string;
+    trustedDescription?: string;
+    tools?: McpToolSummary[];
+    error?: string;
   }>;
   onToggle: (id: string) => void;
+  onDelete: (id: string) => void;
+  onUpdate?: (id: string, patch: { title?: string; detail?: string }) => void;
+  onToggleTrusted?: (id: string) => void;
+  onInspect?: (id: string) => void;
+  inspectingId?: string;
+  inspectLabel?: string;
+  inspectingLabel?: string;
+  toolsLabel?: string;
 }
 
-function RegistryList({ items, onToggle }: RegistryListProps) {
+function RegistryList({
+  items,
+  onToggle,
+  onDelete,
+  onUpdate,
+  onToggleTrusted,
+  onInspect,
+  inspectingId = "",
+  inspectLabel = "",
+  inspectingLabel = "",
+  toolsLabel = ""
+}: RegistryListProps) {
   if (items.length === 0) {
     return null;
   }
@@ -3674,12 +6166,62 @@ function RegistryList({ items, onToggle }: RegistryListProps) {
       {items.map((item) => (
         <article key={item.id} className="registry-item">
           <div>
-            <strong>{item.title}</strong>
-            <code>{item.detail}</code>
+            {onUpdate ? (
+              <div className="registry-edit-grid">
+                <input
+                  value={item.title}
+                  onChange={(event) => onUpdate(item.id, { title: event.target.value })}
+                  placeholder={item.titlePlaceholder || ""}
+                  aria-label={item.titleAriaLabel || item.titlePlaceholder || ""}
+                />
+                <input
+                  value={item.detail}
+                  onChange={(event) => onUpdate(item.id, { detail: event.target.value })}
+                  placeholder={item.detailPlaceholder || ""}
+                  aria-label={item.detailAriaLabel || item.detailPlaceholder || ""}
+                />
+              </div>
+            ) : (
+              <>
+                <strong>{item.title}</strong>
+                <code>{item.detail}</code>
+              </>
+            )}
+            {item.trustedDescription ? <p className="registry-meta">{item.trustedDescription}</p> : null}
+            {item.tools?.length ? (
+              <p className="registry-meta">
+                {toolsLabel}: {item.tools.map((tool) => tool.name).join(", ")}
+              </p>
+            ) : null}
+            {item.error ? <p className="registry-error">{item.error}</p> : null}
           </div>
-          <button className={`toggle ${item.enabled ? "is-on" : ""}`} onClick={() => onToggle(item.id)} type="button">
-            <span />
-          </button>
+          <div className="registry-actions">
+            {onInspect ? (
+              <button
+                className="registry-test"
+                onClick={() => onInspect(item.id)}
+                type="button"
+                disabled={Boolean(inspectingId)}
+              >
+                {inspectingId === item.id ? inspectingLabel : inspectLabel}
+              </button>
+            ) : null}
+            {onToggleTrusted && item.trustedLabel ? (
+              <button
+                className={`registry-trust ${item.trusted ? "is-on" : ""}`}
+                onClick={() => onToggleTrusted(item.id)}
+                type="button"
+              >
+                {item.trustedLabel}
+              </button>
+            ) : null}
+            <button className={`toggle ${item.enabled ? "is-on" : ""}`} onClick={() => onToggle(item.id)} type="button">
+              <span />
+            </button>
+            <button className="registry-delete" onClick={() => onDelete(item.id)} type="button" aria-label="删除">
+              <X size={14} />
+            </button>
+          </div>
         </article>
       ))}
     </div>
@@ -3690,13 +6232,19 @@ interface ToggleProps {
   label: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
+  disabled?: boolean;
 }
 
-function Toggle({ label, checked, onChange }: ToggleProps) {
+function Toggle({ label, checked, onChange, disabled = false }: ToggleProps) {
   return (
-    <label className="toggle-row">
+    <label className={`toggle-row ${disabled ? "is-disabled" : ""}`}>
       <span>{label}</span>
-      <button className={`toggle ${checked ? "is-on" : ""}`} onClick={() => onChange(!checked)} type="button">
+      <button
+        className={`toggle ${checked ? "is-on" : ""}`}
+        onClick={() => onChange(!checked)}
+        type="button"
+        disabled={disabled}
+      >
         <span />
       </button>
     </label>
@@ -3707,20 +6255,26 @@ interface NumberFieldProps {
   label: string;
   value: number;
   field: keyof AppConfig["memory"];
+  min?: number;
   updateDraft: (updater: (current: AppConfig) => AppConfig) => void;
 }
 
-function NumberField({ label, value, field, updateDraft }: NumberFieldProps) {
+function NumberField({ label, value, field, min = 1, updateDraft }: NumberFieldProps) {
   return (
     <Field label={label}>
       <input
         type="number"
-        min={1}
+        min={min}
         value={value}
         onChange={(event) =>
           updateDraft((current) => ({
             ...current,
-            memory: { ...current.memory, [field]: Number(event.target.value) }
+            memory: {
+              ...current.memory,
+              [field]: Number.isFinite(Number(event.target.value))
+                ? Math.max(min, Number(event.target.value))
+                : min
+            }
           }))
         }
       />

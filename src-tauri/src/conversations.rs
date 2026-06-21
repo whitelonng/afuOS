@@ -6,6 +6,16 @@ use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub data_url: String,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredConversation {
     pub id: String,
     pub title: String,
@@ -21,6 +31,7 @@ pub struct StoredMessage {
     pub conversation_id: String,
     pub role: String,
     pub content: String,
+    pub image_attachments: Vec<ImageAttachment>,
     pub created_at: i64,
 }
 
@@ -49,12 +60,18 @@ pub struct SaveMessageRequest {
     pub role: String,
     pub content: String,
     #[serde(default)]
+    pub image_attachments: Vec<ImageAttachment>,
+    #[serde(default)]
     pub created_at: i64,
 }
 
 pub fn save_conversation(app: &AppHandle, request: SaveConversationRequest) -> Result<(), String> {
-    let connection = open_database(app)?;
-    connection
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Failed to start conversation save transaction: {error}"))?;
+
+    transaction
         .execute(
             "INSERT INTO conversations (id, title, summary, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -69,7 +86,7 @@ pub fn save_conversation(app: &AppHandle, request: SaveConversationRequest) -> R
         )
         .map_err(|error| format!("Failed to save conversation: {error}"))?;
 
-    connection
+    transaction
         .execute(
             "DELETE FROM messages WHERE conversation_id = ?1",
             params![request.id],
@@ -77,15 +94,18 @@ pub fn save_conversation(app: &AppHandle, request: SaveConversationRequest) -> R
         .map_err(|error| format!("Failed to replace conversation messages: {error}"))?;
 
     for message in request.messages {
-        connection
+        let image_attachments = serde_json::to_string(&message.image_attachments)
+            .map_err(|error| format!("Failed to serialize message images: {error}"))?;
+        transaction
             .execute(
-                "INSERT INTO messages (id, conversation_id, role, content, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO messages (id, conversation_id, role, content, image_attachments, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     message.id,
                     request.id,
                     message.role,
                     message.content,
+                    image_attachments,
                     if message.created_at > 0 {
                         message.created_at
                     } else {
@@ -95,6 +115,10 @@ pub fn save_conversation(app: &AppHandle, request: SaveConversationRequest) -> R
             )
             .map_err(|error| format!("Failed to save message: {error}"))?;
     }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("Failed to commit conversation save: {error}"))?;
 
     Ok(())
 }
@@ -139,13 +163,53 @@ pub fn list_conversations(
         .collect()
 }
 
+pub fn delete_conversation(app: &AppHandle, conversation_id: String) -> Result<(), String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Failed to start conversation delete transaction: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )
+        .map_err(|error| format!("Failed to delete conversation messages: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM conversations WHERE id = ?1",
+            params![conversation_id],
+        )
+        .map_err(|error| format!("Failed to delete conversation: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Failed to commit conversation delete: {error}"))?;
+    Ok(())
+}
+
+pub fn clear_conversations(app: &AppHandle) -> Result<(), String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Failed to start conversations clear transaction: {error}"))?;
+    transaction
+        .execute("DELETE FROM messages", [])
+        .map_err(|error| format!("Failed to clear conversation messages: {error}"))?;
+    transaction
+        .execute("DELETE FROM conversations", [])
+        .map_err(|error| format!("Failed to clear conversations: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Failed to commit conversations clear: {error}"))?;
+    Ok(())
+}
+
 fn list_messages_for_conversation(
     connection: &rusqlite::Connection,
     conversation_id: &str,
 ) -> Result<Vec<StoredMessage>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT id, conversation_id, role, content, created_at
+            "SELECT id, conversation_id, role, content, image_attachments, created_at
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY created_at ASC",
@@ -159,11 +223,16 @@ fn list_messages_for_conversation(
                 conversation_id: row.get(1)?,
                 role: row.get(2)?,
                 content: row.get(3)?,
-                created_at: row.get(4)?,
+                image_attachments: parse_image_attachments(row.get::<_, String>(4)?),
+                created_at: row.get(5)?,
             })
         })
         .map_err(|error| format!("Failed to read messages: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Failed to collect messages: {error}"))?;
     Ok(messages)
+}
+
+fn parse_image_attachments(raw: String) -> Vec<ImageAttachment> {
+    serde_json::from_str(&raw).unwrap_or_default()
 }

@@ -266,7 +266,7 @@ button {
   font-size: 11px;
 }
 
-.message p {
+.message-bubble {
   width: fit-content;
   max-width: min(420px, 86%);
   margin: 0;
@@ -274,18 +274,52 @@ button {
   border-radius: 16px;
   font-size: 14px;
   line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-images {
+  width: fit-content;
+  max-width: min(420px, 86%);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(86px, 1fr));
+  gap: 6px;
+}
+
+.message-user .message-images {
+  justify-self: end;
+}
+
+.message-images img,
+.message-inline-images img {
+  width: 100%;
+  max-height: 132px;
+  border-radius: 12px;
+  object-fit: cover;
+  background: #111318;
+}
+
+.message-inline-images {
+  width: fit-content;
+  max-width: min(420px, 86%);
+}
+
+.message-inline-images img {
+  display: block;
+  max-width: min(420px, 86vw);
+  height: auto;
 }
 
 .message-user {
   justify-items: end;
 }
 
-.message-user p {
+.message-user .message-bubble {
   color: #0e1726;
   background: #eef1f5;
 }
 
-.message-assistant p {
+.message-assistant .message-bubble {
   color: #f7fafc;
   background: #30333b;
 }
@@ -388,15 +422,61 @@ button {
   background: #fef3c7;
 }
 
-.input-row {
+.input-composer {
   display: grid;
-  grid-template-columns: 38px 1fr 38px;
-  align-items: end;
   gap: 8px;
   padding: 8px;
   border: 1px solid #3b3f49;
   border-radius: 14px;
   background: #272a32;
+}
+
+.pending-images {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.pending-image {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  flex: 0 0 auto;
+}
+
+.pending-image img {
+  width: 100%;
+  height: 100%;
+  border-radius: 10px;
+  object-fit: cover;
+  background: #111318;
+}
+
+.pending-image button {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 50%;
+  color: #ffffff;
+  background: #111827;
+  cursor: pointer;
+}
+
+.input-row {
+  display: grid;
+  grid-template-columns: 38px 38px 1fr 38px;
+  align-items: end;
+  gap: 8px;
+}
+
+.image-input {
+  display: none;
 }
 
 .input-row textarea {
@@ -415,6 +495,7 @@ button {
   color: rgba(246, 247, 251, 0.52);
 }
 
+.attach-button,
 .mic-button,
 .send-button {
   width: 38px;
@@ -422,6 +503,7 @@ button {
   border-radius: 14px;
 }
 
+.attach-button,
 .mic-button {
   background: #343842;
 }
@@ -560,6 +642,8 @@ button {
 .model-add-row {
   display: flex;
   justify-content: end;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .model-add-button {
@@ -836,6 +920,10 @@ button {
   gap: 14px;
 }
 
+.toggle-row.is-disabled {
+  color: #9ca3af;
+}
+
 .toggle {
   width: 42px;
   height: 24px;
@@ -843,6 +931,11 @@ button {
   border-radius: 999px;
   background: rgba(20, 24, 35, 0.18);
   cursor: pointer;
+}
+
+.toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .toggle span {
@@ -920,18 +1013,30 @@ button {
 .history-item {
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: 4px 12px;
+  align-items: center;
+  gap: 12px;
   padding: 11px 12px;
   border: 1px solid #dde1e8;
   border-radius: 10px;
-  color: #141823;
   background: #ffffff;
-  cursor: pointer;
-  text-align: left;
 }
 
 .history-item.is-active {
   border-color: #111827;
+}
+
+.history-item-main {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  padding: 0;
+  border: 0;
+  color: #141823;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
 }
 
 .history-item strong {
@@ -984,6 +1089,13 @@ button {
   padding: 11px 12px;
 }
 
+.log-item-actions {
+  display: inline-grid;
+  justify-items: end;
+  align-content: start;
+  gap: 8px;
+}
+
 .log-item strong,
 .inline-empty strong {
   display: block;
@@ -1025,6 +1137,12 @@ button {
   display: grid;
   gap: 10px;
   padding-top: 4px;
+}
+
+.permission-rules-section {
+  display: grid;
+  gap: 10px;
+  padding-top: 10px;
 }
 
 .memory-file-grid {
@@ -1136,6 +1254,13 @@ button {
   gap: 10px;
 }
 
+.registry-help {
+  margin: 0;
+  color: rgba(20, 24, 35, 0.62);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .registry-input-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -1175,6 +1300,23 @@ button {
   font-size: 13px;
 }
 
+.registry-edit-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.registry-edit-grid input {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  border: 1px solid rgba(20, 24, 35, 0.12);
+  border-radius: 10px;
+  padding: 0 11px;
+  color: #141823;
+  background: #ffffff;
+  font-size: 13px;
+}
+
 .registry-item code {
   display: block;
   overflow: hidden;
@@ -1183,6 +1325,81 @@ button {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.registry-meta,
+.registry-error {
+  overflow: hidden;
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.registry-meta {
+  color: rgba(20, 24, 35, 0.62);
+}
+
+.registry-error {
+  color: #b42318;
+}
+
+.registry-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.registry-test {
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 8px;
+  color: #1f3a5f;
+  background: #e8f1ff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.registry-trust {
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid #d7dce5;
+  border-radius: 8px;
+  color: #495466;
+  background: #f4f6fa;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.registry-trust.is-on {
+  border-color: #bcd3ff;
+  color: #17408b;
+  background: #e9f1ff;
+}
+
+.registry-test:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.registry-delete {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 8px;
+  color: #6b7280;
+  background: #f1f4f8;
+  cursor: pointer;
+}
+
+.registry-delete:hover {
+  color: #991b1b;
+  background: #fee2e2;
 }
 
 .voice-test-panel {

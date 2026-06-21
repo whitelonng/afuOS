@@ -9,10 +9,78 @@ export type AssistantStatus =
 
 export type ChatRole = "system" | "user" | "assistant";
 
+export interface ImageAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  size: number;
+}
+
+export interface SkillDocument {
+  path: string;
+  name: string;
+  content: string;
+  error: string;
+}
+
+export interface McpToolSummary {
+  name: string;
+  description: string;
+}
+
+export interface McpInspectionResult {
+  status: "ok" | "empty" | "error";
+  serverName: string;
+  tools: McpToolSummary[];
+  error: string;
+}
+
+export interface McpToolCallResult {
+  status: "ok" | "error";
+  content: string;
+  raw: string;
+  error: string;
+}
+
+export interface McpToolRequest {
+  command: string;
+  serverName: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface SkillRegistryEntry {
+  id: string;
+  name: string;
+  path: string;
+  enabled: boolean;
+}
+
+export interface McpRegistryEntry {
+  id: string;
+  name: string;
+  command: string;
+  enabled: boolean;
+  tools?: McpToolSummary[];
+  toolError?: string;
+  checkedAt?: number;
+}
+
+export interface McpToolExecutionResponse {
+  status: "completed" | "requiresConfirmation" | "failed";
+  message: string;
+  request?: McpToolRequest | null;
+  confirmation?: ConfirmationPayload | null;
+  log?: ExecutionLog | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
+  imageAttachments?: ImageAttachment[];
+  createdAt?: number;
 }
 
 export interface LocalActionRequest {
@@ -31,6 +99,14 @@ export interface ConfirmationPayload {
   riskLevel: string;
   command: string;
   target: string;
+}
+
+export interface PermissionRule {
+  id: string;
+  actionType: string;
+  target: string;
+  decision: string;
+  createdAt: number;
 }
 
 export interface ExecutionLog {
@@ -65,6 +141,7 @@ export interface ConversationSnapshot {
     conversationId: string;
     role: ChatRole;
     content: string;
+    imageAttachments?: ImageAttachment[];
     createdAt: number;
   }>;
 }
@@ -140,6 +217,10 @@ export interface AppConfig {
     allowBrowserAutomation: boolean;
     blockedPaths: string[];
     trustedSkills: string[];
+  };
+  registries: {
+    skills: SkillRegistryEntry[];
+    mcpServers: McpRegistryEntry[];
   };
   memory: {
     enabled: boolean;
